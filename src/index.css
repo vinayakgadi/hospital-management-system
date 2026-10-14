@@ -1,0 +1,152 @@
+:root {
+  --font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --bg-gradient: linear-gradient(135deg, #f0fdf4 0%, #e0f2fe 50%, #f8fafc 100%);
+  --primary-accent: #0284c7;
+  --primary-dark: #0369a1;
+  --card-bg: #ffffff;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-family);
+  background: #f8fafc;
+  color: #1e293b;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Navbar & Brand */
+.header-hero {
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  color: #ffffff;
+  padding: 2.5rem 0 3.5rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+}
+
+.header-hero::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  right: -20%;
+  width: 500px;
+  height: 500px;
+  background: radial-gradient(circle, rgba(14, 165, 233, 0.25) 0%, rgba(14, 165, 233, 0) 70%);
+  pointer-events: none;
+}
+
+/* Stat Counters Ribbon */
+.stat-pill {
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 12px;
+  padding: 0.6rem 1.2rem;
+  color: #ffffff;
+  transition: transform 0.2s ease;
+}
+
+.stat-pill:hover {
+  transform: translateY(-2px);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* Search and Controls Card */
+.search-box-card {
+  margin-top: -1.75rem;
+  background: #ffffff;
+  border-radius: 16px;
+  padding: 1rem 1.25rem;
+  box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.08), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
+  border: 1px solid #e2e8f0;
+}
+
+.search-input-group .form-control {
+  border-radius: 12px;
+  padding: 0.75rem 1rem;
+  border: 1px solid #cbd5e1;
+  font-size: 0.95rem;
+}
+
+.search-input-group .form-control:focus {
+  border-color: #0ea5e9;
+  box-shadow: 0 0 0 4px rgba(14, 165, 233, 0.15);
+}
+
+.form-select-custom {
+  border-radius: 12px;
+  padding: 0.75rem 1rem;
+  border: 1px solid #cbd5e1;
+  font-size: 0.95rem;
+  background-color: #ffffff;
+}
+
+.form-select-custom:focus {
+  border-color: #0ea5e9;
+  box-shadow: 0 0 0 4px rgba(14, 165, 233, 0.15);
+}
+
+/* Patient Card Styles */
+.patient-card {
+  background: #ffffff;
+  border-radius: 18px;
+  border: 1px solid #e2e8f0;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow: hidden;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
+}
+
+.patient-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 20px 25px -5px rgba(15, 23, 42, 0.08), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
+  border-color: #bae6fd;
+}
+
+.patient-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #0284c7 0%, #06b6d4 100%);
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.25rem;
+  font-weight: 700;
+  box-shadow: 0 4px 6px -1px rgba(2, 132, 199, 0.25);
+}
+
+.patient-avatar.female {
+  background: linear-gradient(135deg, #ec4899 0%, #f43f5e 100%);
+  box-shadow: 0 4px 6px -1px rgba(236, 72, 153, 0.25);
+}
+
+/* Metric Tag Chips */
+.metric-chip {
+  background: #f1f5f9;
+  border-radius: 8px;
+  padding: 0.35rem 0.65rem;
+  font-size: 0.8rem;
+  color: #475569;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.doctor-section {
+  background: #f8fafc;
+  border-radius: 12px;
+  padding: 0.75rem;
+  border: 1px solid #f1f5f9;
+}
+
+.disease-badge {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.35rem 0.65rem;
+  border-radius: 9999px;
+  text-transform: capitalize;
+}
