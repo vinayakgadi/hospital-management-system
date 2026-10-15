@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import axios from 'axios'
 import PatientCard from './PatientCard.jsx'
+import AddPatientModal from './AddPatientModal.jsx'
 
 function App() {
   const [patients, setPatients] = useState([])
@@ -9,6 +10,8 @@ function App() {
   const [sortBy, setSortBy] = useState('name-asc')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [isModalOpen, setIsModalOpen] = useState(false)
+  const [toastNotification, setToastNotification] = useState(null)
 
   const fetchPatients = () => {
     setLoading(true)
@@ -29,6 +32,14 @@ function App() {
   useEffect(() => {
     fetchPatients()
   }, [])
+
+  const handlePatientAdded = (newPatient) => {
+    setPatients((prev) => [newPatient, ...prev])
+    setToastNotification(`Patient record for "${newPatient.name}" created successfully!`)
+    setTimeout(() => {
+      setToastNotification(null)
+    }, 4500)
+  }
 
   // Extract unique disease list for filter options
   const diseaseOptions = useMemo(() => {
@@ -89,6 +100,28 @@ function App() {
 
   return (
     <div className="min-vh-100 bg-light pb-5">
+      {/* Toast Notification */}
+      {toastNotification && (
+        <div
+          className="position-fixed top-0 end-0 p-3"
+          style={{ zIndex: 1090 }}
+        >
+          <div className="alert alert-success alert-dismissible shadow-lg fade show border-0 d-flex align-items-center gap-2 rounded-4 px-4 py-3" role="alert">
+            <i className="bi bi-check-circle-fill text-success fs-5"></i>
+            <div>
+              <strong className="d-block">Success</strong>
+              <small>{toastNotification}</small>
+            </div>
+            <button
+              type="button"
+              className="btn-close"
+              aria-label="Close"
+              onClick={() => setToastNotification(null)}
+            ></button>
+          </div>
+        </div>
+      )}
+
       {/* Hero Header */}
       <header className="header-hero shadow-sm">
         <div className="container">
@@ -105,8 +138,8 @@ function App() {
               </p>
             </div>
 
-            {/* Quick Stat Counter Pills */}
-            <div className="d-flex flex-wrap gap-2">
+            {/* Quick Stat Counter Pills & Add Patient Button */}
+            <div className="d-flex flex-wrap align-items-center gap-2">
               <div className="stat-pill text-center">
                 <small className="d-block text-white-50" style={{ fontSize: '0.75rem' }}>
                   Total Patients
@@ -125,6 +158,15 @@ function App() {
                 </small>
                 <strong className="fs-5">{diseaseOptions.length}</strong>
               </div>
+
+              {/* Add Patient Action Button */}
+              <button
+                className="btn btn-primary px-3 py-2 rounded-pill shadow-sm d-flex align-items-center gap-2 fw-semibold ms-md-2"
+                onClick={() => setIsModalOpen(true)}
+              >
+                <i className="bi bi-person-plus-fill"></i>
+                <span>Add Patient</span>
+              </button>
             </div>
           </div>
         </div>
@@ -218,13 +260,22 @@ function App() {
               )}
             </div>
 
-            <button
-              onClick={fetchPatients}
-              className="btn btn-sm btn-outline-secondary rounded-pill px-3"
-              title="Refresh records"
-            >
-              <i className="bi bi-arrow-clockwise me-1"></i> Refresh
-            </button>
+            <div className="d-flex align-items-center gap-2">
+              <button
+                onClick={() => setIsModalOpen(true)}
+                className="btn btn-sm btn-primary rounded-pill px-3 d-inline-flex align-items-center gap-1"
+              >
+                <i className="bi bi-plus-lg"></i>
+                <span>Add Record</span>
+              </button>
+              <button
+                onClick={fetchPatients}
+                className="btn btn-sm btn-outline-secondary rounded-pill px-3"
+                title="Refresh records"
+              >
+                <i className="bi bi-arrow-clockwise me-1"></i> Refresh
+              </button>
+            </div>
           </div>
         )}
 
@@ -273,12 +324,18 @@ function App() {
                   <p className="text-muted small mb-3">
                     No records match your active search or condition filters.
                   </p>
-                  <div>
+                  <div className="d-flex justify-content-center gap-2">
                     <button
-                      className="btn btn-primary rounded-pill px-4 btn-sm"
+                      className="btn btn-outline-secondary rounded-pill px-4 btn-sm"
                       onClick={handleResetFilters}
                     >
                       Reset Filters
+                    </button>
+                    <button
+                      className="btn btn-primary rounded-pill px-4 btn-sm"
+                      onClick={() => setIsModalOpen(true)}
+                    >
+                      Register New Patient
                     </button>
                   </div>
                 </div>
@@ -293,6 +350,13 @@ function App() {
           </div>
         )}
       </main>
+
+      {/* Add Patient Modal */}
+      <AddPatientModal
+        isOpen={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        onPatientAdded={handlePatientAdded}
+      />
     </div>
   )
 }
