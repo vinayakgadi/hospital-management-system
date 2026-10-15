@@ -4,8 +4,18 @@ import PatientCard from './PatientCard.jsx'
 import AddPatientModal from './AddPatientModal.jsx'
 import EditPatientModal from './EditPatientModal.jsx'
 import DeleteConfirmModal from './DeleteConfirmModal.jsx'
+import LoginPage from './LoginPage.jsx'
 
 function App() {
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      const stored = localStorage.getItem('healthpulse_user')
+      return stored ? JSON.parse(stored) : null
+    } catch {
+      return null
+    }
+  })
+
   const [patients, setPatients] = useState([])
   const [search, setSearch] = useState('')
   const [selectedDisease, setSelectedDisease] = useState('ALL')
@@ -42,8 +52,15 @@ function App() {
   }
 
   useEffect(() => {
-    fetchPatients()
-  }, [])
+    if (currentUser) {
+      fetchPatients()
+    }
+  }, [currentUser])
+
+  const handleLogout = () => {
+    localStorage.removeItem('healthpulse_user')
+    setCurrentUser(null)
+  }
 
   // Create Patient Handler
   const handlePatientAdded = (newPatient) => {
@@ -137,6 +154,11 @@ function App() {
     setSortBy('name-asc')
   }
 
+  // If user is not logged in, show Login Page
+  if (!currentUser) {
+    return <LoginPage onLoginSuccess={(user) => setCurrentUser(user)} />
+  }
+
   return (
     <div className="min-vh-100 bg-light pb-5">
       {/* Toast Notification */}
@@ -184,7 +206,7 @@ function App() {
               </p>
             </div>
 
-            {/* Quick Stat Counter Pills & Add Patient Button */}
+            {/* Quick Stat Counter Pills & User Info */}
             <div className="d-flex flex-wrap align-items-center gap-2">
               <div className="stat-pill text-center">
                 <small className="d-block text-white-50" style={{ fontSize: '0.75rem' }}>
@@ -213,6 +235,26 @@ function App() {
                 <i className="bi bi-person-plus-fill"></i>
                 <span>Add Patient</span>
               </button>
+
+              {/* User Identity & Logout */}
+              <div className="d-flex align-items-center gap-2 border-start border-secondary ps-3 ms-2">
+                <div className="text-end d-none d-lg-block">
+                  <small className="d-block text-white fw-semibold" style={{ fontSize: '0.85rem' }}>
+                    {currentUser.name}
+                  </small>
+                  <span className="badge bg-info-subtle text-info border border-info-subtle" style={{ fontSize: '0.65rem' }}>
+                    {currentUser.role || 'Authorized'}
+                  </span>
+                </div>
+                <button
+                  className="btn btn-outline-light btn-sm rounded-pill px-3 d-flex align-items-center gap-1"
+                  onClick={handleLogout}
+                  title="Sign out of portal"
+                >
+                  <i className="bi bi-box-arrow-right"></i>
+                  <span>Sign Out</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
