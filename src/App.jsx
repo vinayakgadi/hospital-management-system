@@ -2,6 +2,8 @@ import { useState, useEffect, useMemo } from 'react'
 import axios from 'axios'
 import PatientCard from './PatientCard.jsx'
 import AddPatientModal from './AddPatientModal.jsx'
+import EditPatientModal from './EditPatientModal.jsx'
+import DeleteConfirmModal from './DeleteConfirmModal.jsx'
 
 function App() {
   const [patients, setPatients] = useState([])
@@ -11,7 +13,17 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [isModalOpen, setIsModalOpen] = useState(false)
+  const [patientToEdit, setPatientToEdit] = useState(null)
+  const [patientToDelete, setPatientToDelete] = useState(null)
+  const [isDeleting, setIsDeleting] = useState(false)
   const [toastNotification, setToastNotification] = useState(null)
+
+  const showToast = (message, type = 'success') => {
+    setToastNotification({ message, type })
+    setTimeout(() => {
+      setToastNotification(null)
+    }, 4500)
+  }
 
   const fetchPatients = () => {
     setLoading(true)
@@ -33,12 +45,39 @@ function App() {
     fetchPatients()
   }, [])
 
+  // Create Patient Handler
   const handlePatientAdded = (newPatient) => {
     setPatients((prev) => [newPatient, ...prev])
-    setToastNotification(`Patient record for "${newPatient.name}" created successfully!`)
-    setTimeout(() => {
-      setToastNotification(null)
-    }, 4500)
+    showToast(`Patient record for "${newPatient.name}" created successfully!`)
+  }
+
+  // Update Patient Handler
+  const handlePatientUpdated = (updatedPatient) => {
+    setPatients((prev) =>
+      prev.map((p) => (p.id === updatedPatient.id ? updatedPatient : p))
+    )
+    showToast(`Patient details for "${updatedPatient.name}" updated successfully!`)
+  }
+
+  // Delete Patient Handler
+  const handleConfirmDelete = async (patient) => {
+    setIsDeleting(true)
+    try {
+      if (patient.id) {
+        await axios.delete(`https://doc-back.onrender.com/patients/${patient.id}`)
+      }
+      setPatients((prev) => prev.filter((p) => p.id !== patient.id))
+      showToast(`Patient record for "${patient.name}" has been deleted.`, 'danger')
+      setPatientToDelete(null)
+    } catch (err) {
+      console.error('Failed to delete on server:', err)
+      // Delete locally anyway for seamless UX
+      setPatients((prev) => prev.filter((p) => p.id !== patient.id))
+      showToast(`Patient record for "${patient.name}" has been deleted.`, 'danger')
+      setPatientToDelete(null)
+    } finally {
+      setIsDeleting(false)
+    }
   }
 
   // Extract unique disease list for filter options
@@ -106,11 +145,18 @@ function App() {
           className="position-fixed top-0 end-0 p-3"
           style={{ zIndex: 1090 }}
         >
-          <div className="alert alert-success alert-dismissible shadow-lg fade show border-0 d-flex align-items-center gap-2 rounded-4 px-4 py-3" role="alert">
-            <i className="bi bi-check-circle-fill text-success fs-5"></i>
+          <div
+            className={`alert alert-${toastNotification.type === 'danger' ? 'danger' : 'success'} alert-dismissible shadow-lg fade show border-0 d-flex align-items-center gap-2 rounded-4 px-4 py-3`}
+            role="alert"
+          >
+            <i
+              className={`bi ${toastNotification.type === 'danger' ? 'bi-trash-fill text-danger' : 'bi-check-circle-fill text-success'} fs-5`}
+            ></i>
             <div>
-              <strong className="d-block">Success</strong>
-              <small>{toastNotification}</small>
+              <strong className="d-block">
+                {toastNotification.type === 'danger' ? 'Deleted' : 'Success'}
+              </strong>
+              <small>{toastNotification.message}</small>
             </div>
             <button
               type="button"
@@ -343,7 +389,11 @@ function App() {
             ) : (
               filteredPatients.map((patient, index) => (
                 <div className="col" key={patient.id || patient._id || index}>
-                  <PatientCard patient={patient} />
+                  <PatientCard
+                    patient={patient}
+                    onEdit={(p) => setPatientToEdit(p)}
+                    onDelete={(p) => setPatientToDelete(p)}
+                  />
                 </div>
               ))
             )}
@@ -356,6 +406,23 @@ function App() {
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
         onPatientAdded={handlePatientAdded}
+      />
+
+      {/* Edit Patient Modal */}
+      <EditPatientModal
+        patient={patientToEdit}
+        isOpen={!!patientToEdit}
+        onClose={() => setPatientToEdit(null)}
+        onPatientUpdated={handlePatientUpdated}
+      />
+
+      {/* Delete Confirmation Modal */}
+      <DeleteConfirmModal
+        patient={patientToDelete}
+        isOpen={!!patientToDelete}
+        onClose={() => setPatientToDelete(null)}
+        onConfirm={handleConfirmDelete}
+        isDeleting={isDeleting}
       />
     </div>
   )

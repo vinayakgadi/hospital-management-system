@@ -1,4 +1,4 @@
-function PatientCard({ patient }) {
+function PatientCard({ patient, onEdit, onDelete }) {
     const isFemale = (patient.gender || '').toLowerCase() === 'female'
     const initials = (patient.name || 'P')
         .split(' ')
@@ -22,7 +22,7 @@ function PatientCard({ patient }) {
     return (
         <div className="card patient-card h-100">
             <div className="card-body p-4 d-flex flex-column">
-                {/* Header: Avatar, Name & Disease */}
+                {/* Header: Avatar, Name & Email */}
                 <div className="d-flex align-items-start justify-content-between mb-3">
                     <div className="d-flex align-items-center gap-3">
                         <div className={`patient-avatar ${isFemale ? 'female' : ''}`}>
@@ -70,8 +70,8 @@ function PatientCard({ patient }) {
                     </span>
                 </div>
 
-                {/* Doctor Section (Pushed to bottom) */}
-                <div className="doctor-section mt-auto">
+                {/* Doctor Section */}
+                <div className="doctor-section mt-auto mb-3">
                     <div className="d-flex align-items-center justify-content-between">
                         <div className="d-flex align-items-center gap-2">
                             <i className="bi bi-heart-pulse-fill text-danger fs-5"></i>
@@ -88,6 +88,32 @@ function PatientCard({ patient }) {
                             {patient.doctor?.specialization || 'General'}
                         </span>
                     </div>
+                </div>
+
+                {/* Card Action Controls: Edit & Delete */}
+                <div className="d-flex align-items-center justify-content-end gap-2 pt-2 border-top">
+                    {onEdit && (
+                        <button
+                            type="button"
+                            className="btn btn-sm btn-outline-primary rounded-pill px-3 d-inline-flex align-items-center gap-1"
+                            onClick={() => onEdit(patient)}
+                            title="Edit patient details"
+                        >
+                            <i className="bi bi-pencil-square"></i>
+                            <span>Edit</span>
+                        </button>
+                    )}
+                    {onDelete && (
+                        <button
+                            type="button"
+                            className="btn btn-sm btn-outline-danger rounded-pill px-3 d-inline-flex align-items-center gap-1"
+                            onClick={() => onDelete(patient)}
+                            title="Delete patient record"
+                        >
+                            <i className="bi bi-trash3"></i>
+                            <span>Delete</span>
+                        </button>
+                    )}
                 </div>
             </div>
         </div>
