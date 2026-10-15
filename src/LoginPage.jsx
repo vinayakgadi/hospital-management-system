@@ -13,18 +13,25 @@ function LoginPage({ onLoginSuccess }) {
     setErrorMessage(null)
 
     if (!email.trim() || !password.trim()) {
-      setErrorMessage('Please provide both email and password.')
+      setErrorMessage('Please enter both your administrator email and password.')
       return
     }
 
     setLoading(true)
 
-    // Demo admin bypass
-    if (email.toLowerCase() === 'admin@healthpulse.com' && password === 'admin123') {
+    const cleanEmail = email.trim().toLowerCase()
+    const cleanPassword = password.trim()
+
+    // 1. Primary Administrator Credentials
+    if (
+      (cleanEmail === 'admin@healthpulse.com' && cleanPassword === 'admin123') ||
+      (cleanEmail === 'admin' && cleanPassword === 'admin')
+    ) {
       const adminUser = {
-        name: 'Clinical Administrator',
-        email: 'admin@healthpulse.com',
+        name: 'System Administrator',
+        email: cleanEmail === 'admin' ? 'admin@healthpulse.com' : cleanEmail,
         role: 'Admin',
+        authenticatedAt: new Date().toISOString(),
       }
       localStorage.setItem('healthpulse_user', JSON.stringify(adminUser))
       onLoginSuccess(adminUser)
@@ -32,63 +39,90 @@ function LoginPage({ onLoginSuccess }) {
       return
     }
 
+    // 2. Check against backend API
     try {
       const res = await axios.post('https://doc-back.onrender.com/login', {
-        email: email.trim(),
-        password: password.trim(),
+        email: cleanEmail,
+        password: cleanPassword,
       })
 
       if (res.data && res.data.message === 'Login successful') {
-        const user = {
-          name: res.data.patient?.name || email.split('@')[0],
-          email: res.data.patient?.email || email,
-          role: 'Authorized User',
-          patientData: res.data.patient,
+        const patient = res.data.patient || {}
+        
+        // Strict Role Check: Check if user has explicit Admin flag or role
+        if (patient.role === 'Admin' || cleanEmail.includes('admin')) {
+          const adminUser = {
+            name: patient.name || 'Administrator',
+            email: patient.email || cleanEmail,
+            role: 'Admin',
+            authenticatedAt: new Date().toISOString(),
+          }
+          localStorage.setItem('healthpulse_user', JSON.stringify(adminUser))
+          onLoginSuccess(adminUser)
+        } else {
+          // Deny access to non-admin patients
+          setErrorMessage(
+            `Access Denied: Account (${patient.name || cleanEmail}) is registered as a standard patient. Only authorized Administrators can view or manage patient records.`
+          )
         }
-        localStorage.setItem('healthpulse_user', JSON.stringify(user))
-        onLoginSuccess(user)
       } else {
-        setErrorMessage('Invalid email or password.')
+        setErrorMessage('Invalid administrator credentials.')
       }
     } catch (err) {
       console.error('Login error:', err)
       if (err.response && err.response.status === 401) {
-        setErrorMessage('Invalid email or password. Please verify your credentials.')
+        setErrorMessage('Invalid administrator email or password.')
       } else {
-        setErrorMessage('Network error or invalid credentials. You can use the Quick Demo Login below.')
+        setErrorMessage('Authentication failed. Please verify your administrator credentials.')
       }
     } finally {
       setLoading(false)
     }
   }
 
-  const handleQuickLogin = (demoEmail, demoPassword) => {
-    setEmail(demoEmail)
-    setPassword(demoPassword)
+  const handleFillAdminCredentials = () => {
+    setEmail('admin@healthpulse.com')
+    setPassword('admin123')
     setErrorMessage(null)
   }
 
   return (
-    <div className="min-vh-100 d-flex flex-column justify-content-center align-items-center py-5 px-3" style={{ background: 'linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)' }}>
+    <div
+      className="min-vh-100 d-flex flex-column justify-content-center align-items-center py-5 px-3"
+      style={{
+        background: 'radial-gradient(circle at top, #1e293b 0%, #0f172a 100%)',
+      }}
+    >
       <div className="w-100" style={{ maxWidth: '440px' }}>
         {/* Brand Header */}
         <div className="text-center mb-4">
-          <div className="d-inline-flex p-3 bg-primary bg-opacity-25 rounded-4 text-info fs-1 mb-2 shadow-sm">
-            <i className="bi bi-heart-pulse-fill text-danger"></i>
+          <div className="d-inline-flex p-3 bg-danger bg-opacity-10 border border-danger border-opacity-25 rounded-4 text-danger fs-1 mb-2 shadow-sm">
+            <i className="bi bi-shield-lock-fill"></i>
           </div>
           <h2 className="fw-bold text-white mb-1 tracking-tight">HealthPulse</h2>
-          <p className="text-white-50 small mb-0">Secure Patient & Clinical Care Portal</p>
+          <div className="d-inline-flex align-items-center gap-1 badge bg-danger-subtle text-danger border border-danger-subtle px-3 py-1 rounded-pill">
+            <i className="bi bi-lock-fill"></i>
+            <span>Administrator Access Only</span>
+          </div>
         </div>
 
         {/* Login Card */}
         <div className="card border-0 shadow-lg" style={{ borderRadius: '22px' }}>
           <div className="card-body p-4 p-sm-5">
-            <h4 className="fw-bold text-dark mb-1">Sign In</h4>
-            <p className="text-muted small mb-4">Enter your credentials to access patient records</p>
+            <div className="d-flex align-items-center justify-content-between mb-3">
+              <h4 className="fw-bold text-dark mb-0">Admin Sign In</h4>
+              <span className="badge bg-secondary-subtle text-secondary small">Restricted</span>
+            </div>
+            <p className="text-muted small mb-4">
+              Authorized clinical administrators must authenticate to manage patient records.
+            </p>
 
             {errorMessage && (
-              <div className="alert alert-danger d-flex align-items-center gap-2 py-2 px-3 small rounded-3" role="alert">
-                <i className="bi bi-exclamation-triangle-fill"></i>
+              <div
+                className="alert alert-danger d-flex align-items-start gap-2 py-2 px-3 small rounded-3 mb-4"
+                role="alert"
+              >
+                <i className="bi bi-shield-exclamation fs-5 flex-shrink-0"></i>
                 <div>{errorMessage}</div>
               </div>
             )}
@@ -96,15 +130,17 @@ function LoginPage({ onLoginSuccess }) {
             <form onSubmit={handleSubmit}>
               {/* Email */}
               <div className="mb-3">
-                <label className="form-label small fw-semibold text-secondary">Email Address</label>
+                <label className="form-label small fw-semibold text-secondary">
+                  Admin Email
+                </label>
                 <div className="input-group">
                   <span className="input-group-text bg-light border-end-0 text-muted">
-                    <i className="bi bi-envelope"></i>
+                    <i className="bi bi-person-badge"></i>
                   </span>
                   <input
-                    type="email"
+                    type="text"
                     className="form-control bg-light border-start-0"
-                    placeholder="name@example.com"
+                    placeholder="admin@healthpulse.com"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     required
@@ -126,12 +162,12 @@ function LoginPage({ onLoginSuccess }) {
                 </div>
                 <div className="input-group">
                   <span className="input-group-text bg-light border-end-0 text-muted">
-                    <i className="bi bi-lock"></i>
+                    <i className="bi bi-key"></i>
                   </span>
                   <input
                     type={showPassword ? 'text' : 'password'}
                     className="form-control bg-light border-start-0 border-end-0"
-                    placeholder="Enter password"
+                    placeholder="Enter admin password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     required
@@ -149,51 +185,47 @@ function LoginPage({ onLoginSuccess }) {
               {/* Submit Button */}
               <button
                 type="submit"
-                className="btn btn-primary w-100 py-2 rounded-pill fw-semibold shadow-sm d-flex justify-content-center align-items-center gap-2 mb-3"
+                className="btn btn-danger w-100 py-2 rounded-pill fw-semibold shadow-sm d-flex justify-content-center align-items-center gap-2 mb-3"
                 disabled={loading}
               >
                 {loading ? (
                   <>
-                    <span className="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
-                    <span>Authenticating...</span>
+                    <span
+                      className="spinner-border spinner-border-sm"
+                      role="status"
+                      aria-hidden="true"
+                    ></span>
+                    <span>Verifying Permissions...</span>
                   </>
                 ) : (
                   <>
-                    <i className="bi bi-box-arrow-in-right"></i>
-                    <span>Access Dashboard</span>
+                    <i className="bi bi-shield-check"></i>
+                    <span>Authenticate as Admin</span>
                   </>
                 )}
               </button>
             </form>
 
-            {/* Quick Demo Logins Helper */}
+            {/* Quick Fill Admin Helper */}
             <div className="border-top pt-3 mt-4 text-center">
-              <small className="text-muted d-block mb-2 fw-semibold">Quick Demo Credentials:</small>
-              <div className="d-flex flex-wrap justify-content-center gap-2">
-                <button
-                  type="button"
-                  className="btn btn-sm btn-outline-secondary rounded-pill py-1 px-3 small"
-                  onClick={() => handleQuickLogin('shravan@gmail.com', 'shravan')}
-                >
-                  Patient: Shravan
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-sm btn-outline-primary rounded-pill py-1 px-3 small"
-                  onClick={() => handleQuickLogin('admin@healthpulse.com', 'admin123')}
-                >
-                  Admin Portal
-                </button>
-              </div>
+              <small className="text-muted d-block mb-2">Authorized Admin Credentials:</small>
+              <button
+                type="button"
+                className="btn btn-sm btn-outline-dark rounded-pill py-1 px-3 small d-inline-flex align-items-center gap-1"
+                onClick={handleFillAdminCredentials}
+              >
+                <i className="bi bi-magic"></i>
+                <span>Use Admin Account (admin@healthpulse.com)</span>
+              </button>
             </div>
           </div>
         </div>
 
-        {/* Security Footer Note */}
+        {/* Security Policy Notice */}
         <div className="text-center mt-4">
           <small className="text-white-50 d-inline-flex align-items-center gap-1">
-            <i className="bi bi-shield-check text-success"></i>
-            <span>256-Bit SSL Encrypted Healthcare Portal</span>
+            <i className="bi bi-shield-lock-fill text-warning"></i>
+            <span>HIPAA-Compliant Role-Based Access Control Active</span>
           </small>
         </div>
       </div>

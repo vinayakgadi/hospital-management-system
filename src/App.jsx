@@ -10,7 +10,9 @@ function App() {
   const [currentUser, setCurrentUser] = useState(() => {
     try {
       const stored = localStorage.getItem('healthpulse_user')
-      return stored ? JSON.parse(stored) : null
+      if (!stored) return null
+      const parsed = JSON.parse(stored)
+      return parsed && parsed.role === 'Admin' ? parsed : null
     } catch {
       return null
     }
@@ -52,7 +54,7 @@ function App() {
   }
 
   useEffect(() => {
-    if (currentUser) {
+    if (currentUser && currentUser.role === 'Admin') {
       fetchPatients()
     }
   }, [currentUser])
@@ -154,8 +156,8 @@ function App() {
     setSortBy('name-asc')
   }
 
-  // If user is not logged in, show Login Page
-  if (!currentUser) {
+  // Only Administrators can access the patient data
+  if (!currentUser || currentUser.role !== 'Admin') {
     return <LoginPage onLoginSuccess={(user) => setCurrentUser(user)} />
   }
 
@@ -199,10 +201,12 @@ function App() {
                 <span className="p-2 bg-primary bg-opacity-25 rounded-3 d-inline-flex text-info fs-4">
                   <i className="bi bi-heart-pulse-fill text-danger"></i>
                 </span>
-                <h2 className="fw-bold mb-0 text-white tracking-tight">HealthPulse</h2>
+                <h2 className="fw-bold mb-0 text-white tracking-tight">
+                  HealthPulse <span className="badge bg-danger fs-6 align-middle ms-2">Admin Portal</span>
+                </h2>
               </div>
               <p className="text-white-50 mb-0">
-                Centralized Patient Directory & Clinical Care Portal
+                Administrator Directory • Clinical Care & Patient Record Management
               </p>
             </div>
 
@@ -242,8 +246,8 @@ function App() {
                   <small className="d-block text-white fw-semibold" style={{ fontSize: '0.85rem' }}>
                     {currentUser.name}
                   </small>
-                  <span className="badge bg-info-subtle text-info border border-info-subtle" style={{ fontSize: '0.65rem' }}>
-                    {currentUser.role || 'Authorized'}
+                  <span className="badge bg-danger text-white border border-danger-subtle" style={{ fontSize: '0.65rem' }}>
+                    System Administrator
                   </span>
                 </div>
                 <button
