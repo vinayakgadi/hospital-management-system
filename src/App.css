@@ -1,1 +1,101 @@
+/* HealthPulse SaaS Design System */
 
+:root {
+  --primary-navy: #0f172a;
+  --secondary-navy: #1e293b;
+  --primary-blue: #0284c7;
+  --primary-cyan: #06b6d4;
+  --bg-main: #f8fafc;
+  --card-border: #e2e8f0;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Dark Navy Sidebar Styling */
+.sidebar-nav {
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 4px 0 24px rgba(15, 23, 42, 0.05);
+}
+
+.sidebar-nav .nav-link {
+  color: #94a3b8;
+  font-weight: 500;
+  border-radius: 10px;
+  transition: all 0.2s ease;
+}
+
+.sidebar-nav .nav-link:hover {
+  color: #ffffff;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.sidebar-nav .nav-link.active {
+  background: #0284c7;
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(2, 132, 199, 0.3);
+}
+
+/* Mobile Responsive Sidebar */
+@media (max-width: 991.98px) {
+  .sidebar-nav {
+    transform: translateX(-100%);
+  }
+  .sidebar-nav.show {
+    transform: translateX(0);
+  }
+  div[style*="margin-left: 260px"] {
+    margin-left: 0 !important;
+  }
+}
+
+/* Cards & Layout */
+.card {
+  border: 1px solid var(--card-border);
+}
+
+.shadow-xs {
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+/* Subtle transitions */
+.transition-all {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.hover-bg-light:hover {
+  background-color: #f8fafc;
+}
+
+/* Pulse Animation for Live Indicators */
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.7);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 6px rgba(14, 165, 233, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(14, 165, 233, 0);
+  }
+}
+
+.animate-pulse-ring {
+  animation: pulse-ring 2s infinite;
+}
