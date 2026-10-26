@@ -1,8 +1,5 @@
-// API Configuration
-// When set to '' (empty string), requests use Vite's internal development proxy (/patients -> http://127.0.0.1:5000)
-// This avoids CORS restrictions and allows seamless local communication.
-export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL !== undefined 
-  ? import.meta.env.VITE_API_BASE_URL 
-  : ''
+// HealthPulse Local Python Backend Configuration
+// All API communication routes directly to your Python Flask server.
+export const API_BASE_URL = 'http://localhost:5000'
 
 export default API_BASE_URL
