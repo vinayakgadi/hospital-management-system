@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "backend": "py -3.7 backend/app.py",
+    "start": "start cmd /k \"py -3.7 backend/app.py\" && vite",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"

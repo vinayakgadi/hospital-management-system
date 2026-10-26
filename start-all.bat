@@ -1,0 +1,13 @@
+@echo off
+echo ========================================================
+echo Starting HealthPulse Full Stack (Backend + Frontend)...
+echo ========================================================
+
+echo Starting Python Flask API on http://localhost:5000 ...
+start "HealthPulse Backend (Python)" cmd /k "py -3.7 backend\app.py"
+
+echo Waiting 2 seconds for backend to initialize...
+timeout /t 2 /nobreak >nul
+
+echo Starting Vite React Frontend on http://localhost:5173 ...
+npm run dev
