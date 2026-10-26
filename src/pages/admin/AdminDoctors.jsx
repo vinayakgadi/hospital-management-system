@@ -14,6 +14,8 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  UserX,
+  UserCheck,
 } from 'lucide-react'
 
 export default function AdminDoctors() {
@@ -23,6 +25,7 @@ export default function AdminDoctors() {
   const [search, setSearch] = useState('')
   const [selectedSpecialization, setSelectedSpecialization] = useState('ALL')
   const [isRegisterOpen, setIsRegisterOpen] = useState(false)
+  const [togglingId, setTogglingId] = useState(null)
   const [toast, setToast] = useState(null)
 
   const showToast = (message, type = 'success') => {
@@ -55,6 +58,41 @@ export default function AdminDoctors() {
     showToast(`Physician "${newDoc.name}" registered successfully!`)
   }
 
+  const handleToggleStatus = async (doc) => {
+    if (!doc.user_id) {
+      showToast('No user account linked to this physician profile.', 'danger')
+      return
+    }
+
+    const isCurrentlyActive = (doc.status || '').toLowerCase() === 'active'
+    const newActiveState = !isCurrentlyActive
+    const actionLabel = newActiveState ? 'activate' : 'deactivate'
+
+    if (
+      !window.confirm(
+        `Are you sure you want to ${actionLabel} Dr. ${doc.name}'s account? ${
+          !newActiveState ? 'Their active sessions will be terminated immediately.' : ''
+        }`
+      )
+    ) {
+      return
+    }
+
+    setTogglingId(doc.id)
+    try {
+      await axios.put(`${API_BASE_URL}/api/admin/users/${doc.user_id}/status`, {
+        is_active: newActiveState,
+      })
+      showToast(`Account for Dr. ${doc.name} ${newActiveState ? 'activated' : 'deactivated'}.`)
+      fetchDoctors()
+    } catch (err) {
+      console.error('Failed to update doctor status:', err)
+      showToast(err.response?.data?.error || 'Failed to update account status.', 'danger')
+    } finally {
+      setTogglingId(null)
+    }
+  }
+
   // Unique specializations
   const specializations = useMemo(() => {
     const set = new Set()
@@ -85,13 +123,29 @@ export default function AdminDoctors() {
       {/* Toast Notification */}
       {toast && (
         <div className="position-fixed top-0 end-0 p-3" style={{ zIndex: 1099 }}>
-          <div className="alert alert-success shadow-lg border-0 d-flex align-items-center gap-2 rounded-4 px-4 py-3" role="alert">
-            <CheckCircle2 size={20} className="text-success flex-shrink-0" />
+          <div
+            className={`alert alert-${
+              toast.type === 'danger' ? 'danger' : 'success'
+            } shadow-lg border-0 d-flex align-items-center gap-2 rounded-4 px-4 py-3`}
+            role="alert"
+          >
+            {toast.type === 'danger' ? (
+              <AlertCircle size={20} className="text-danger flex-shrink-0" />
+            ) : (
+              <CheckCircle2 size={20} className="text-success flex-shrink-0" />
+            )}
             <div>
-              <strong className="d-block small">Success</strong>
+              <strong className="d-block small">
+                {toast.type === 'danger' ? 'Action Failed' : 'Success'}
+              </strong>
               <small>{toast.message}</small>
             </div>
-            <button type="button" className="btn-close ms-auto" aria-label="Close" onClick={() => setToast(null)} />
+            <button
+              type="button"
+              className="btn-close ms-auto"
+              aria-label="Close"
+              onClick={() => setToast(null)}
+            />
           </div>
         </div>
       )}
@@ -221,76 +275,110 @@ export default function AdminDoctors() {
               </div>
             </div>
           ) : (
-            filteredDoctors.map((doc) => (
-              <div className="col" key={doc.id}>
-                <div
-                  className="card border-0 shadow-sm rounded-4 h-100 bg-white transition-all overflow-hidden"
-                  style={{
-                    border: '1px solid #e2e8f0',
-                    transition: 'transform 0.2s ease, box-shadow 0.2s ease',
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.transform = 'translateY(-3px)'
-                    e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(15, 23, 42, 0.08)'
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.transform = 'translateY(0)'
-                    e.currentTarget.style.boxShadow = '0 1px 3px 0 rgba(0, 0, 0, 0.05)'
-                  }}
-                >
-                  <div className="card-body p-4 d-flex flex-column">
-                    {/* Header */}
-                    <div className="d-flex align-items-start justify-content-between mb-3">
-                      <div className="d-flex align-items-center gap-3">
-                        <div
-                          className="rounded-3 d-flex align-items-center justify-content-center text-white fw-bold shadow-xs flex-shrink-0"
-                          style={{
-                            width: 48,
-                            height: 48,
-                            background: 'linear-gradient(135deg, #0284c7 0%, #06b6d4 100%)',
-                            fontSize: '1.1rem',
-                          }}
+            filteredDoctors.map((doc) => {
+              const isActive = (doc.status || '').toLowerCase() === 'active'
+              return (
+                <div className="col" key={doc.id}>
+                  <div
+                    className="card border-0 shadow-sm rounded-4 h-100 bg-white transition-all overflow-hidden"
+                    style={{
+                      border: '1px solid #e2e8f0',
+                      transition: 'transform 0.2s ease, box-shadow 0.2s ease',
+                      opacity: isActive ? 1 : 0.75,
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.transform = 'translateY(-3px)'
+                      e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(15, 23, 42, 0.08)'
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.transform = 'translateY(0)'
+                      e.currentTarget.style.boxShadow = '0 1px 3px 0 rgba(0, 0, 0, 0.05)'
+                    }}
+                  >
+                    <div className="card-body p-4 d-flex flex-column">
+                      {/* Header */}
+                      <div className="d-flex align-items-start justify-content-between mb-3">
+                        <div className="d-flex align-items-center gap-3">
+                          <div
+                            className="rounded-3 d-flex align-items-center justify-content-center text-white fw-bold shadow-xs flex-shrink-0"
+                            style={{
+                              width: 48,
+                              height: 48,
+                              background: isActive
+                                ? 'linear-gradient(135deg, #0284c7 0%, #06b6d4 100%)'
+                                : 'linear-gradient(135deg, #64748b 0%, #94a3b8 100%)',
+                              fontSize: '1.1rem',
+                            }}
+                          >
+                            DR
+                          </div>
+                          <div>
+                            <h5 className="fw-bold mb-0 text-dark" style={{ fontSize: '1.05rem' }}>
+                              {doc.name}
+                            </h5>
+                            <span className="badge bg-primary-subtle text-primary border border-primary-subtle rounded-pill small mt-1">
+                              {doc.specialization}
+                            </span>
+                          </div>
+                        </div>
+                        <span
+                          className={`badge rounded-pill small ${
+                            isActive
+                              ? 'bg-success-subtle text-success border border-success-subtle'
+                              : 'bg-danger-subtle text-danger border border-danger-subtle'
+                          }`}
                         >
-                          DR
-                        </div>
-                        <div>
-                          <h5 className="fw-bold mb-0 text-dark" style={{ fontSize: '1.05rem' }}>
-                            {doc.name}
-                          </h5>
-                          <span className="badge bg-primary-subtle text-primary border border-primary-subtle rounded-pill small mt-1">
-                            {doc.specialization}
-                          </span>
-                        </div>
+                          {isActive ? 'Active Duty' : 'Deactivated'}
+                        </span>
                       </div>
-                      <span className="badge bg-success-subtle text-success border border-success-subtle small">
-                        {doc.status || 'Active'}
-                      </span>
-                    </div>
 
-                    {/* Contact details */}
-                    <div className="py-2 border-top border-bottom my-2">
-                      <div className="d-flex align-items-center gap-2 text-secondary small mb-2">
-                        <Mail size={15} className="text-muted" />
-                        <span className="text-truncate">{doc.email}</span>
+                      {/* Contact details */}
+                      <div className="py-2 border-top border-bottom my-2">
+                        <div className="d-flex align-items-center gap-2 text-secondary small mb-2">
+                          <Mail size={15} className="text-muted" />
+                          <span className="text-truncate">{doc.email}</span>
+                        </div>
+                        <div className="d-flex align-items-center gap-2 text-secondary small">
+                          <Phone size={15} className="text-muted" />
+                          <span>{doc.phone || '555-0199'}</span>
+                        </div>
                       </div>
-                      <div className="d-flex align-items-center gap-2 text-secondary small">
-                        <Phone size={15} className="text-muted" />
-                        <span>{doc.phone || '555-0199'}</span>
-                      </div>
-                    </div>
 
-                    {/* Metadata Footer */}
-                    <div className="mt-auto pt-2 d-flex align-items-center justify-content-between text-muted small">
-                      <span className="d-flex align-items-center gap-1" style={{ fontSize: '0.75rem' }}>
-                        <ShieldCheck size={14} className="text-success" />
-                        <span>Credentialed</span>
-                      </span>
-                      <span style={{ fontSize: '0.72rem' }}>Doctor ID: #{doc.id}</span>
+                      {/* Metadata Footer & Deactivation Action */}
+                      <div className="mt-auto pt-3 d-flex align-items-center justify-content-between">
+                        <span className="text-muted" style={{ fontSize: '0.72rem' }}>
+                          ID: #{doc.id}
+                        </span>
+
+                        {doc.user_id && (
+                          <button
+                            type="button"
+                            className={`btn btn-sm rounded-pill px-3 d-inline-flex align-items-center gap-1 ${
+                              isActive ? 'btn-outline-danger' : 'btn-outline-success'
+                            }`}
+                            style={{ fontSize: '0.75rem' }}
+                            disabled={togglingId === doc.id}
+                            onClick={() => handleToggleStatus(doc)}
+                          >
+                            {isActive ? (
+                              <>
+                                <UserX size={13} />
+                                <span>Deactivate</span>
+                              </>
+                            ) : (
+                              <>
+                                <UserCheck size={13} />
+                                <span>Reactivate</span>
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
-            ))
+              )
+            })
           )}
         </div>
       )}

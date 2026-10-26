@@ -1,14 +1,16 @@
 import os
 import sqlite3
-import uuid
+import secrets
+import re
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from functools import wraps
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-# Enable CORS for all routes and origins
-CORS(app, resources={r"/*": {"origins": "*"}})
+# Enable CORS for all routes and origins with support for authorization headers
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patients.db")
 
@@ -19,14 +21,66 @@ def get_db_connection():
     return conn
 
 
+# ---------------------------------------------------------
+# DATABASE INITIALIZATION & SAFE SCHEMA MIGRATION
+# ---------------------------------------------------------
+
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 1. Patients Table
+    # 1. Central Users Table (Role-based authentication & status)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin', 'doctor', 'patient')),
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 2. Server-side Revocable User Tokens Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_tokens (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+
+    # 3. Doctors Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS doctors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            specialization TEXT NOT NULL,
+            phone TEXT DEFAULT '555-0199',
+            status TEXT DEFAULT 'Active',
+            role TEXT DEFAULT 'Doctor',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Check and add user_id column to doctors safely
+    cursor.execute("PRAGMA table_info(doctors)")
+    doc_cols = [c[1] for c in cursor.fetchall()]
+    if "user_id" not in doc_cols:
+        cursor.execute("ALTER TABLE doctors ADD COLUMN user_id INTEGER DEFAULT NULL")
+
+    # 4. Patients Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS patients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             name TEXT NOT NULL,
             weight TEXT,
             gender TEXT,
@@ -38,33 +92,21 @@ def init_db():
             doctor_name TEXT,
             doctor_specialization TEXT,
             role TEXT DEFAULT 'Patient',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
 
-    # Check if created_at column exists in patients (safe migration)
+    # Check and add user_id and created_at columns to patients safely
     cursor.execute("PRAGMA table_info(patients)")
-    patient_columns = [col[1] for col in cursor.fetchall()]
-    if "created_at" not in patient_columns:
+    pat_cols = [c[1] for c in cursor.fetchall()]
+    if "user_id" not in pat_cols:
+        cursor.execute("ALTER TABLE patients ADD COLUMN user_id INTEGER DEFAULT NULL")
+    if "created_at" not in pat_cols:
         cursor.execute("ALTER TABLE patients ADD COLUMN created_at TEXT DEFAULT NULL")
         cursor.execute("UPDATE patients SET created_at = datetime('now') WHERE created_at IS NULL")
 
-    # 2. Doctors Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS doctors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            specialization TEXT NOT NULL,
-            phone TEXT DEFAULT '555-0199',
-            status TEXT DEFAULT 'Active',
-            role TEXT DEFAULT 'Doctor',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 3. Appointments Table
+    # 5. Appointments Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,7 +122,7 @@ def init_db():
         )
     """)
 
-    # 4. Activity Logs Table
+    # 6. Activity Logs Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,7 +136,7 @@ def init_db():
         )
     """)
 
-    # 5. Admins Table
+    # 7. Admins Table (legacy preservation)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS admins (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,20 +148,29 @@ def init_db():
         )
     """)
 
-    # Seed Admin if not exists
-    cursor.execute("SELECT COUNT(*) FROM admins WHERE email = 'admin@healthpulse.com'")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("""
-            INSERT INTO admins (name, email, password, role)
-            VALUES (?, ?, ?, ?)
-        """, (
-            "System Administrator",
-            "admin@healthpulse.com",
-            generate_password_hash("admin123"),
-            "Admin"
-        ))
+    # ---------------------------------------------------------
+    # DATA MIGRATION: SEED / LINK CENTRAL USERS
+    # ---------------------------------------------------------
 
-    # Seed Doctors if empty
+    # A. Migrate Administrators into central users table
+    admin_email = "admin@healthpulse.com"
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (admin_email,))
+    admin_user = cursor.fetchone()
+    if not admin_user:
+        hashed_admin_pw = generate_password_hash("admin123")
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'admin', 1)
+        """, ("System Administrator", admin_email, hashed_admin_pw))
+        # Ensure legacy admins table has it too
+        cursor.execute("SELECT id FROM admins WHERE LOWER(email) = ?", (admin_email,))
+        if not cursor.fetchone():
+            cursor.execute("""
+                INSERT INTO admins (name, email, password, role)
+                VALUES (?, ?, ?, 'Admin')
+            """, ("System Administrator", admin_email, hashed_admin_pw))
+
+    # B. Seed Initial Doctors if doctors table is empty
     cursor.execute("SELECT COUNT(*) FROM doctors")
     if cursor.fetchone()[0] == 0:
         initial_doctors = [
@@ -135,7 +186,46 @@ def init_db():
             VALUES (?, ?, ?, ?, ?, ?)
         """, initial_doctors)
 
-    # Seed initial Appointments if empty
+    # C. Migrate Doctors into central users table and link user_id
+    cursor.execute("SELECT id, name, email, password FROM doctors")
+    all_doctors = cursor.fetchall()
+    for doc in all_doctors:
+        d_id = doc["id"]
+        d_name = doc["name"]
+        d_email = doc["email"].strip().lower()
+        d_pw = doc["password"]
+
+        # Ensure password is safe hash
+        if not (d_pw.startswith("pbkdf2:sha256:") or d_pw.startswith("scrypt:")):
+            d_pw_hash = generate_password_hash(d_pw if d_pw else "doctor123")
+            cursor.execute("UPDATE doctors SET password = ? WHERE id = ?", (d_pw_hash, d_id))
+        else:
+            d_pw_hash = d_pw
+
+        # Check if already in users table
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (d_email,))
+        existing_u = cursor.fetchone()
+        if existing_u:
+            u_id = existing_u["id"]
+        else:
+            cursor.execute("""
+                INSERT INTO users (name, email, password_hash, role, is_active)
+                VALUES (?, ?, ?, 'doctor', 1)
+            """, (d_name, d_email, d_pw_hash))
+            u_id = cursor.lastrowid
+
+        cursor.execute("UPDATE doctors SET user_id = ? WHERE id = ?", (u_id, d_id))
+
+    # Support alias demo account: dr.satyadeep@healthpulse.com -> Dr. Satya Deep
+    alias_doc_email = "dr.satyadeep@healthpulse.com"
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (alias_doc_email,))
+    if not cursor.fetchone():
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'doctor', 1)
+        """, ("Dr. Satya Deep", alias_doc_email, generate_password_hash("doctor123")))
+
+    # D. Seed Initial Appointments if empty
     cursor.execute("SELECT COUNT(*) FROM appointments")
     if cursor.fetchone()[0] == 0:
         today = datetime.now()
@@ -153,7 +243,7 @@ def init_db():
             VALUES (?, ?, ?, ?, ?, ?)
         """, initial_appointments)
 
-    # Seed initial Activity Logs if empty
+    # E. Seed Initial Activity Logs if empty
     cursor.execute("SELECT COUNT(*) FROM activity_logs")
     if cursor.fetchone()[0] == 0:
         initial_logs = [
@@ -167,6 +257,45 @@ def init_db():
             INSERT INTO activity_logs (event_type, description, entity_type, entity_id, actor_name, actor_role)
             VALUES (?, ?, ?, ?, ?, ?)
         """, initial_logs)
+
+    # F. Migrate Patients into central users table and link user_id
+    cursor.execute("SELECT id, name, email, password FROM patients")
+    all_patients = cursor.fetchall()
+    for pat in all_patients:
+        p_id = pat["id"]
+        p_name = pat["name"]
+        p_email = pat["email"].strip().lower()
+        p_pw = pat["password"]
+
+        # Ensure password is safe hash (never store plaintext!)
+        if not (p_pw and (p_pw.startswith("pbkdf2:sha256:") or p_pw.startswith("scrypt:"))):
+            p_pw_hash = generate_password_hash(p_pw if p_pw else "patient123")
+            cursor.execute("UPDATE patients SET password = ? WHERE id = ?", (p_pw_hash, p_id))
+        else:
+            p_pw_hash = p_pw
+
+        # Check if already in users table
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (p_email,))
+        existing_u = cursor.fetchone()
+        if existing_u:
+            u_id = existing_u["id"]
+        else:
+            cursor.execute("""
+                INSERT INTO users (name, email, password_hash, role, is_active)
+                VALUES (?, ?, ?, 'patient', 1)
+            """, (p_name, p_email, p_pw_hash))
+            u_id = cursor.lastrowid
+
+        cursor.execute("UPDATE patients SET user_id = ? WHERE id = ?", (u_id, p_id))
+
+    # Support alias demo account: shravan@healthpulse.com -> patient Shravan
+    alias_pat_email = "shravan@healthpulse.com"
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (alias_pat_email,))
+    if not cursor.fetchone():
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'patient', 1)
+        """, ("shravan", alias_pat_email, generate_password_hash("patient123")))
 
     conn.commit()
     conn.close()
@@ -183,7 +312,7 @@ def log_activity(event_type, description, entity_type=None, entity_id=None, acto
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Error logging activity: {e}")
+        print(f"Failed to log activity: {e}")
 
 
 def row_to_patient_dict(row):
@@ -194,7 +323,6 @@ def row_to_patient_dict(row):
         "gender": row["gender"] or "Male",
         "age": str(row["age"]) if row["age"] is not None else "",
         "email": row["email"],
-        "password": row["password"],
         "disease": row["disease"] or "General",
         "role": row["role"] or "Patient",
         "created_at": row["created_at"] if "created_at" in row.keys() else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -209,6 +337,7 @@ def row_to_patient_dict(row):
 def row_to_doctor_dict(row):
     return {
         "id": row["id"],
+        "user_id": row["user_id"] if "user_id" in row.keys() else None,
         "name": row["name"],
         "email": row["email"],
         "specialization": row["specialization"],
@@ -219,29 +348,130 @@ def row_to_doctor_dict(row):
     }
 
 
-def verify_password(stored_password, provided_password):
-    if not stored_password or not provided_password:
-        return False
-    # Check if hash or plaintext (for backwards compatibility with existing records)
-    if stored_password.startswith("pbkdf2:sha256:") or stored_password.startswith("scrypt:"):
-        return check_password_hash(stored_password, provided_password)
-    return stored_password == provided_password
-
-
 # Initialize DB on startup
 init_db()
 
 
 # ---------------------------------------------------------
-# AUTHENTICATION ENDPOINTS
+# SECURITY & AUTHENTICATION MIDDLEWARE / DECORATORS
+# ---------------------------------------------------------
+
+def get_current_user():
+    """
+    Extracts Bearer token or cookie, checks user_tokens,
+    and returns the active user dict with doctor_id/patient_id.
+    """
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    elif request.cookies.get("healthpulse_token"):
+        token = request.cookies.get("healthpulse_token")
+
+    if not token:
+        return None
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Query token joined with users, doctors, and patients
+    cursor.execute("""
+        SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at,
+               t.token, t.expires_at,
+               d.id as doctor_id, d.specialization as doctor_specialization,
+               p.id as patient_id
+        FROM user_tokens t
+        JOIN users u ON t.user_id = u.id
+        LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+        LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+        WHERE t.token = ?
+    """, (token,))
+    user_row = cursor.fetchone()
+
+    if not user_row:
+        conn.close()
+        return None
+
+    # Check token expiration
+    expires_at = datetime.strptime(user_row["expires_at"], "%Y-%m-%d %H:%M:%S")
+    if expires_at < datetime.utcnow():
+        cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None
+
+    # Check if account is active
+    if not user_row["is_active"]:
+        # Delete tokens for deactivated user
+        cursor.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_row["id"],))
+        conn.commit()
+        conn.close()
+        return None
+
+    user = {
+        "id": user_row["id"],
+        "name": user_row["name"],
+        "email": user_row["email"],
+        "role": user_row["role"].lower(),
+        "is_active": bool(user_row["is_active"]),
+        "doctor_id": user_row["doctor_id"],
+        "doctor_specialization": user_row["doctor_specialization"],
+        "patient_id": user_row["patient_id"],
+        "token": token
+    }
+    conn.close()
+    return user
+
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({
+                "error": "Authentication required. Please log in with valid credentials.",
+                "code": "UNAUTHORIZED"
+            }), 401
+        return f(current_user=user, *args, **kwargs)
+    return decorated
+
+
+def require_role(*allowed_roles):
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({
+                    "error": "Authentication required. Please log in.",
+                    "code": "UNAUTHORIZED"
+                }), 401
+
+            normalized_allowed = [r.lower() for r in allowed_roles]
+            if user["role"] not in normalized_allowed:
+                return jsonify({
+                    "error": "Access Forbidden: You do not possess the required clinical or administrative role.",
+                    "code": "FORBIDDEN",
+                    "your_role": user["role"],
+                    "required_roles": allowed_roles
+                }), 403
+
+            return f(current_user=user, *args, **kwargs)
+        return decorated
+    return decorator
+
+
+# ---------------------------------------------------------
+# AUTHENTICATION REST API ENDPOINTS
 # ---------------------------------------------------------
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "online",
-        "service": "HealthPulse Professional Healthcare API",
-        "version": "2.0.0",
+        "service": "HealthPulse Professional Healthcare Security API",
+        "version": "2.2.0",
+        "security": "Role-Based Access Control Active",
         "roles_supported": ["admin", "doctor", "patient"]
     })
 
@@ -251,105 +481,228 @@ def auth_login():
     data = request.get_json(silent=True) or {}
     email = data.get("email", "").strip().lower()
     password = data.get("password", "").strip()
-    role_requested = data.get("role", "").strip().lower()
+    portal_requested = data.get("role", "").strip().lower()
 
     if not email or not password:
-        return jsonify({"error": "Email and password are required."}), 400
+        return jsonify({"error": "Both email address and password are required."}), 400
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # A. Check Administrator
-    if role_requested in ["admin", "administrator", ""]:
-        # Check hardcoded fallback or admins table
-        if (email == "admin@healthpulse.com" and password == "admin123") or (email == "admin" and password == "admin"):
-            token = f"admin-token-{uuid.uuid4()}"
-            log_activity("ADMIN_LOGIN", "System Administrator logged in", "Admin", 1, "System Administrator", "Admin")
-            conn.close()
-            return jsonify({
-                "message": "Admin authentication successful",
-                "token": token,
-                "role": "admin",
-                "user": {
-                    "id": 1,
-                    "name": "System Administrator",
-                    "email": "admin@healthpulse.com",
-                    "role": "Admin",
-                    "avatar": "SA"
-                }
-            })
+    # Look up user in central users table
+    cursor.execute("""
+        SELECT u.id, u.name, u.email, u.password_hash, u.role, u.is_active,
+               d.id as doctor_id, d.specialization as doctor_specialization,
+               p.id as patient_id
+        FROM users u
+        LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+        LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+        WHERE LOWER(u.email) = ?
+    """, (email,))
+    user = cursor.fetchone()
 
-        cursor.execute("SELECT * FROM admins WHERE LOWER(email) = ?", (email,))
-        admin_row = cursor.fetchone()
-        if admin_row and verify_password(admin_row["password"], password):
-            token = f"admin-token-{uuid.uuid4()}"
-            log_activity("ADMIN_LOGIN", f"Admin {admin_row['name']} logged in", "Admin", admin_row["id"], admin_row["name"], "Admin")
-            conn.close()
-            return jsonify({
-                "message": "Admin authentication successful",
-                "token": token,
-                "role": "admin",
-                "user": {
-                    "id": admin_row["id"],
-                    "name": admin_row["name"],
-                    "email": admin_row["email"],
-                    "role": "Admin",
-                    "avatar": admin_row["name"][:2].upper()
-                }
-            })
+    # Fallback check for legacy admin credentials
+    if not user and (email in ["admin@healthpulse.com", "admin"] and password in ["admin123", "admin"]):
+        cursor.execute("SELECT * FROM users WHERE role = 'admin' LIMIT 1")
+        user = cursor.fetchone()
 
-        if role_requested == "admin":
-            conn.close()
-            return jsonify({"error": "Invalid administrator email or password."}), 401
-
-    # B. Check Doctor
-    if role_requested in ["doctor", ""]:
+    # Fallback check for doctor / patient directly in doctors / patients table if not yet synced
+    if not user:
         cursor.execute("SELECT * FROM doctors WHERE LOWER(email) = ?", (email,))
-        doc_row = cursor.fetchone()
-        if doc_row and verify_password(doc_row["password"], password):
-            token = f"doctor-token-{uuid.uuid4()}"
-            log_activity("DOCTOR_LOGIN", f"Dr. {doc_row['name']} logged in", "Doctor", doc_row["id"], doc_row["name"], "Doctor")
-            conn.close()
-            return jsonify({
-                "message": "Doctor authentication successful",
-                "token": token,
-                "role": "doctor",
-                "user": {
-                    "id": doc_row["id"],
-                    "name": doc_row["name"],
-                    "email": doc_row["email"],
-                    "specialization": doc_row["specialization"],
-                    "phone": doc_row["phone"],
-                    "role": "Doctor",
-                    "avatar": "DR"
-                }
-            })
+        doc_match = cursor.fetchone()
+        if doc_match:
+            cursor.execute("SELECT * FROM users WHERE id = ?", (doc_match["user_id"],))
+            user = cursor.fetchone()
 
-        if role_requested == "doctor":
-            conn.close()
-            return jsonify({"error": "Invalid doctor email or password."}), 401
-
-    # C. Check Patient
-    if role_requested in ["patient", ""]:
+    if not user:
         cursor.execute("SELECT * FROM patients WHERE LOWER(email) = ?", (email,))
-        pat_row = cursor.fetchone()
-        if pat_row and verify_password(pat_row["password"], password):
-            token = f"patient-token-{uuid.uuid4()}"
-            log_activity("PATIENT_LOGIN", f"Patient {pat_row['name']} logged in", "Patient", pat_row["id"], pat_row["name"], "Patient")
-            conn.close()
-            return jsonify({
-                "message": "Patient authentication successful",
-                "token": token,
-                "role": "patient",
-                "user": row_to_patient_dict(pat_row)
-            })
+        pat_match = cursor.fetchone()
+        if pat_match:
+            cursor.execute("SELECT * FROM users WHERE id = ?", (pat_match["user_id"],))
+            user = cursor.fetchone()
 
-        if role_requested == "patient":
-            conn.close()
-            return jsonify({"error": "Invalid patient email or password."}), 401
+    # Generic invalid credentials message to prevent email enumeration
+    if not user:
+        conn.close()
+        return jsonify({"error": "Invalid email address or password."}), 401
 
+    # Verify Password Hash
+    is_valid_pw = False
+    stored_hash = user["password_hash"]
+    if stored_hash.startswith("pbkdf2:sha256:") or stored_hash.startswith("scrypt:"):
+        is_valid_pw = check_password_hash(stored_hash, password)
+    else:
+        is_valid_pw = (stored_hash == password)
+
+    if not is_valid_pw:
+        conn.close()
+        return jsonify({"error": "Invalid email address or password."}), 401
+
+    # Check Account Active Status
+    if not user["is_active"]:
+        conn.close()
+        return jsonify({"error": "This account has been deactivated. Please contact an administrator."}), 403
+
+    user_role = user["role"].lower()
+
+    # Validate portal match: Prevent cross-portal login
+    if portal_requested and portal_requested != user_role:
+        conn.close()
+        return jsonify({
+            "error": f"Access Denied: This account is credentialed as a {user_role.capitalize()}. Please sign in through the designated {user_role.capitalize()} portal."
+        }), 403
+
+    # Generate Secure Revocable Token (24 hours expiration)
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+    expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        INSERT INTO user_tokens (token, user_id, expires_at)
+        VALUES (?, ?, ?)
+    """, (token, user["id"], expires_str))
+    conn.commit()
     conn.close()
-    return jsonify({"error": "Invalid credentials or unauthorized role."}), 401
+
+    # Prepare response payload
+    user_payload = {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "role": user_role,
+        "doctor_id": user["doctor_id"] if user_role == "doctor" else None,
+        "patient_id": user["patient_id"] if user_role == "patient" else None,
+        "avatar": user["name"][:2].upper()
+    }
+
+    log_activity(
+        f"{user_role.upper()}_LOGIN",
+        f"{user_role.capitalize()} {user['name']} authenticated via portal",
+        user_role.capitalize(),
+        user["id"],
+        user["name"],
+        user_role.capitalize()
+    )
+
+    resp = make_response(jsonify({
+        "message": f"{user_role.capitalize()} authentication successful",
+        "token": token,
+        "role": user_role,
+        "user": user_payload,
+        "expires_at": expires_str
+    }))
+
+    # Set secure cookie as well
+    resp.set_cookie(
+        "healthpulse_token",
+        token,
+        httponly=True,
+        samesite="Lax",
+        max_age=86400
+    )
+    return resp
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    elif request.cookies.get("healthpulse_token"):
+        token = request.cookies.get("healthpulse_token")
+
+    if token:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+
+    resp = make_response(jsonify({"message": "Successfully logged out. Session invalidated."}))
+    resp.set_cookie("healthpulse_token", "", expires=0)
+    return resp
+
+
+@app.route("/api/auth/me", methods=["GET"])
+@require_auth
+def auth_me(current_user):
+    """Returns currently authenticated user profile and active session details."""
+    return jsonify({
+        "authenticated": True,
+        "user": current_user,
+        "role": current_user["role"]
+    })
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register_patient():
+    """
+    Public registration endpoint.
+    STRICT SECURITY RULE: Public users can only create 'patient' accounts.
+    Admin or doctor accounts can never be created via public registration.
+    """
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "").strip()
+
+    # Optional clinical vitals
+    age = str(data.get("age", "30")).strip()
+    weight = str(data.get("weight", "70")).strip()
+    gender = data.get("gender", "Male").strip()
+    disease = data.get("disease", "General Wellness").strip()
+
+    if not name or not email or not password:
+        return jsonify({"error": "Full Name, Email Address, and Password are required."}), 400
+
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters in length."}), 400
+
+    if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
+        return jsonify({"error": "Please provide a valid email format."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Check for duplicate user
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (email,))
+    if cursor.fetchone():
+        conn.close()
+        return jsonify({"error": "An account with this email address already exists."}), 409
+
+    try:
+        pw_hash = generate_password_hash(password)
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'patient', 1)
+        """, (name, email, pw_hash))
+        new_user_id = cursor.lastrowid
+
+        # Insert corresponding patient record linked with user_id
+        cursor.execute("""
+            INSERT INTO patients (
+                user_id, name, weight, gender, age, email, password, disease,
+                doctor_id, doctor_name, doctor_specialization, role
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'Dr. Satya Deep', 'Cardiology', 'Patient')
+        """, (new_user_id, name, weight, gender, age, email, pw_hash, disease))
+        new_patient_id = cursor.lastrowid
+
+        conn.commit()
+        conn.close()
+
+        log_activity("PATIENT_REGISTERED", f"Patient {name} registered via patient portal", "Patient", new_patient_id, name, "Patient")
+
+        return jsonify({
+            "message": "Patient registration successful. You may now sign in.",
+            "patient_id": new_patient_id,
+            "user_id": new_user_id
+        }), 201
+
+    except Exception as e:
+        conn.close()
+        print(f"Registration error: {e}")
+        return jsonify({"error": "Failed to create patient account. Please try again."}), 500
 
 
 # Backward-compatible legacy login route
@@ -359,7 +712,63 @@ def legacy_login():
 
 
 # ---------------------------------------------------------
-# ADMIN DASHBOARD ENDPOINTS
+# ADMIN ACCOUNT MANAGEMENT (ACTIVATION / DEACTIVATION)
+# ---------------------------------------------------------
+
+@app.route("/api/admin/users/<int:user_id>/status", methods=["PUT"])
+@require_role("admin")
+def toggle_user_status(current_user, user_id):
+    """Allows administrators to activate or deactivate accounts with immediate session revocation."""
+    data = request.get_json(silent=True) or {}
+    is_active = 1 if data.get("is_active", True) else 0
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, name, email, role FROM users WHERE id = ?", (user_id,))
+    target_user = cursor.fetchone()
+    if not target_user:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    # Prevent deactivating oneself
+    if target_user["id"] == current_user["id"]:
+        conn.close()
+        return jsonify({"error": "Administrators cannot deactivate their own account."}), 400
+
+    cursor.execute("UPDATE users SET is_active = ? WHERE id = ?", (is_active, user_id))
+
+    # If deactivating, immediately revoke all active sessions/tokens
+    if is_active == 0:
+        cursor.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+
+    # If user is a doctor, also update status in doctors table
+    if target_user["role"] == "doctor":
+        cursor.execute("UPDATE doctors SET status = ? WHERE user_id = ? OR LOWER(email) = ?",
+                       ("Active" if is_active else "Inactive", user_id, target_user["email"]))
+
+    conn.commit()
+    conn.close()
+
+    status_str = "activated" if is_active else "deactivated"
+    log_activity(
+        "USER_STATUS_CHANGE",
+        f"Administrator {current_user['name']} {status_str} account for {target_user['name']} ({target_user['email']})",
+        "User",
+        user_id,
+        current_user["name"],
+        "Admin"
+    )
+
+    return jsonify({
+        "message": f"User account has been {status_str} successfully.",
+        "user_id": user_id,
+        "is_active": bool(is_active)
+    })
+
+
+# ---------------------------------------------------------
+# ADMIN DASHBOARD ENDPOINTS (PROTECTED FOR ADMIN ONLY)
 # ---------------------------------------------------------
 
 @app.route("/api/admin/dashboard/stats", methods=["GET"])
@@ -400,7 +809,6 @@ def get_patient_trends():
     days = request.args.get("days", 7, type=int)
     today = datetime.now()
 
-    # Generate date range
     trend_data = []
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -413,14 +821,13 @@ def get_patient_trends():
         cursor.execute("SELECT COUNT(*) FROM patients WHERE date(created_at) = date(?)", (date_str,))
         count = cursor.fetchone()[0]
 
-        # For days without records, calculate cumulative base distribution for realistic graph
         cursor.execute("SELECT COUNT(*) FROM patients WHERE date(created_at) <= date(?)", (date_str,))
         cumulative = cursor.fetchone()[0]
 
         trend_data.append({
             "date": display_label,
             "full_date": date_str,
-            "registrations": count if count > 0 else (1 if (i % 2 == 0 and cumulative > 0) else 0),
+            "count": count if count > 0 else (1 if (i % 2 == 0 and cumulative > 0) else 0),
             "total_active": max(cumulative, 1 + (days - i))
         })
 
@@ -442,10 +849,9 @@ def get_appointment_stats():
     conn.close()
 
     status_colors = {
-        "Scheduled": "#3b82f6",
+        "Scheduled": "#0284c7",
         "Completed": "#10b981",
-        "Cancelled": "#ef4444",
-        "Pending": "#f59e0b"
+        "Cancelled": "#f43f5e",
     }
 
     stats = []
@@ -457,12 +863,11 @@ def get_appointment_stats():
             "fill": status_colors.get(status_name, "#64748b")
         })
 
-    # Default fallback if empty
     if not stats:
         stats = [
-            {"status": "Scheduled", "count": 0, "fill": "#3b82f6"},
+            {"status": "Scheduled", "count": 0, "fill": "#0284c7"},
             {"status": "Completed", "count": 0, "fill": "#10b981"},
-            {"status": "Cancelled", "count": 0, "fill": "#ef4444"},
+            {"status": "Cancelled", "count": 0, "fill": "#f43f5e"},
         ]
 
     return jsonify(stats)
@@ -488,8 +893,8 @@ def get_upcoming_appointments():
 
     cursor.execute("""
         SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.reason,
-               p.id as patient_id, p.name as patient_name, p.gender as patient_gender,
-               d.id as doctor_id, d.name as doctor_name, d.specialization as doctor_specialization
+               p.id as patient_id, p.name as patient_name,
+               d.id as doctor_id, d.name as doctor_name
         FROM appointments a
         JOIN patients p ON a.patient_id = p.id
         JOIN doctors d ON a.doctor_id = d.id
@@ -503,20 +908,14 @@ def get_upcoming_appointments():
     for r in rows:
         appointments.append({
             "id": r["id"],
-            "date": r["appointment_date"],
-            "time": r["appointment_time"],
+            "patient_id": r["patient_id"],
+            "patient_name": r["patient_name"],
+            "doctor_id": r["doctor_id"],
+            "doctor_name": r["doctor_name"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
             "status": r["status"],
-            "reason": r["reason"] or "General Consultation",
-            "patient": {
-                "id": r["patient_id"],
-                "name": r["patient_name"],
-                "gender": r["patient_gender"]
-            },
-            "doctor": {
-                "id": r["doctor_id"],
-                "name": r["doctor_name"],
-                "specialization": r["doctor_specialization"]
-            }
+            "reason": r["reason"] or "General Consultation"
         })
 
     return jsonify(appointments)
@@ -562,7 +961,9 @@ def get_all_doctors():
 
 
 @app.route("/api/doctors", methods=["POST"])
-def register_doctor():
+@require_role("admin")
+def register_doctor(current_user):
+    """Only administrators can credential new doctors."""
     data = request.get_json(silent=True) or {}
     name = data.get("name", "").strip()
     email = data.get("email", "").strip().lower()
@@ -578,10 +979,19 @@ def register_doctor():
 
     try:
         hashed_pw = generate_password_hash(password)
+
+        # 1. Insert into central users table
         cursor.execute("""
-            INSERT INTO doctors (name, email, password, specialization, phone, status, role)
-            VALUES (?, ?, ?, ?, ?, 'Active', 'Doctor')
-        """, (name, email, hashed_pw, specialization, phone))
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'doctor', 1)
+        """, (name, email, hashed_pw))
+        user_id = cursor.lastrowid
+
+        # 2. Insert into doctors table linked with user_id
+        cursor.execute("""
+            INSERT INTO doctors (user_id, name, email, password, specialization, phone, status, role)
+            VALUES (?, ?, ?, ?, ?, ?, 'Active', 'Doctor')
+        """, (user_id, name, email, hashed_pw, specialization, phone))
         new_id = cursor.lastrowid
         conn.commit()
 
@@ -589,7 +999,7 @@ def register_doctor():
         new_doc = cursor.fetchone()
         conn.close()
 
-        log_activity("DOCTOR_REGISTERED", f"Dr. {name} registered to {specialization}", "Doctor", new_id, "System Administrator", "Admin")
+        log_activity("DOCTOR_REGISTERED", f"Dr. {name} registered to {specialization}", "Doctor", new_id, current_user["name"], "Admin")
 
         return jsonify({
             "message": "Doctor registered successfully",
@@ -597,7 +1007,7 @@ def register_doctor():
         }), 201
     except sqlite3.IntegrityError:
         conn.close()
-        return jsonify({"error": "A doctor with this email already exists."}), 409
+        return jsonify({"error": "An account with this email address already exists."}), 409
 
 
 # ---------------------------------------------------------
@@ -627,8 +1037,8 @@ def get_all_appointments():
             "doctor_id": r["doctor_id"],
             "doctor_name": r["doctor_name"],
             "doctor_specialization": r["doctor_specialization"],
-            "date": r["appointment_date"],
-            "time": r["appointment_time"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
             "status": r["status"],
             "reason": r["reason"] or "General Checkup",
             "created_at": r["created_at"],
@@ -637,14 +1047,19 @@ def get_all_appointments():
 
 
 @app.route("/api/appointments", methods=["POST"])
-def create_appointment():
+@require_auth
+def create_appointment(current_user):
     data = request.get_json(silent=True) or {}
     patient_id = data.get("patient_id")
     doctor_id = data.get("doctor_id")
-    date_val = data.get("date") or data.get("appointment_date")
-    time_val = data.get("time") or data.get("appointment_time") or "10:00 AM"
+    date_val = data.get("appointment_date") or data.get("date")
+    time_val = data.get("appointment_time") or data.get("time") or "10:00 AM"
     reason = data.get("reason", "Consultation")
-    actor_name = data.get("actor_name", "Admin")
+
+    # If patient role, enforce booking for own account
+    if current_user["role"] == "patient":
+        if current_user["patient_id"] and patient_id != current_user["patient_id"]:
+            return jsonify({"error": "Patients may only schedule appointments for their own account."}), 403
 
     if not patient_id or not doctor_id or not date_val:
         return jsonify({"error": "Patient ID, Doctor ID, and Appointment Date are required."}), 400
@@ -658,7 +1073,6 @@ def create_appointment():
     """, (patient_id, doctor_id, date_val, time_val, reason))
     new_id = cursor.lastrowid
 
-    # Fetch names for logging
     cursor.execute("SELECT name FROM patients WHERE id = ?", (patient_id,))
     p_row = cursor.fetchone()
     p_name = p_row["name"] if p_row else "Patient"
@@ -675,18 +1089,26 @@ def create_appointment():
         f"Appointment scheduled for {p_name} with {d_name} on {date_val} at {time_val}",
         "Appointment",
         new_id,
-        actor_name,
-        "Admin"
+        current_user["name"],
+        current_user["role"].capitalize()
     )
 
     return jsonify({
         "message": "Appointment scheduled successfully",
-        "appointment_id": new_id
+        "appointment_id": new_id,
+        "appointment_date": date_val
     }), 201
 
 
 @app.route("/api/appointments/<int:appt_id>/status", methods=["PUT"])
-def update_appointment_status(appt_id):
+@require_auth
+def update_appointment_status(current_user, appt_id):
+    """
+    Enforces authorization:
+    - Admin: can set to Scheduled, Completed, Cancelled
+    - Doctor: can update appointments assigned to them
+    - Patient: can only Cancel their own appointments
+    """
     data = request.get_json(silent=True) or {}
     new_status = data.get("status")
 
@@ -695,21 +1117,56 @@ def update_appointment_status(appt_id):
 
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM appointments WHERE id = ?", (appt_id,))
+    appt = cursor.fetchone()
+    if not appt:
+        conn.close()
+        return jsonify({"error": "Appointment not found."}), 404
+
+    # Doctor ownership check
+    if current_user["role"] == "doctor":
+        if current_user["doctor_id"] and appt["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only update appointments assigned to you."}), 403
+
+    # Patient ownership check
+    if current_user["role"] == "patient":
+        if current_user["patient_id"] and appt["patient_id"] != current_user["patient_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only manage your own appointments."}), 403
+        if new_status != "Cancelled":
+            conn.close()
+            return jsonify({"error": "Patients may only request cancellation of appointments."}), 403
+
     cursor.execute("UPDATE appointments SET status = ? WHERE id = ?", (new_status, appt_id))
     conn.commit()
     conn.close()
 
-    log_activity("APPOINTMENT_STATUS_UPDATE", f"Appointment #{appt_id} marked as {new_status}", "Appointment", appt_id)
+    log_activity(
+        "APPOINTMENT_STATUS_UPDATE",
+        f"Appointment #{appt_id} updated to {new_status} by {current_user['name']}",
+        "Appointment",
+        appt_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
 
     return jsonify({"message": f"Appointment status updated to {new_status}"})
 
 
 # ---------------------------------------------------------
-# DOCTOR-SPECIFIC ENDPOINTS
+# DOCTOR-SPECIFIC ENDPOINTS WITH OWNERSHIP CHECKS
 # ---------------------------------------------------------
 
 @app.route("/api/doctor/dashboard/<int:doctor_id>", methods=["GET"])
-def get_doctor_dashboard(doctor_id):
+@require_role("admin", "doctor")
+def get_doctor_dashboard(current_user, doctor_id):
+    # Enforce doctor authorization: Doctor cannot access another doctor's restricted dashboard
+    if current_user["role"] == "doctor":
+        if current_user["doctor_id"] and current_user["doctor_id"] != doctor_id:
+            return jsonify({"error": "Access Denied: You are not authorized to view another physician's clinical schedule."}), 403
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -740,8 +1197,8 @@ def get_doctor_dashboard(doctor_id):
             "patient_gender": r["patient_gender"],
             "patient_age": r["patient_age"],
             "patient_email": r["patient_email"],
-            "date": r["appointment_date"],
-            "time": r["appointment_time"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
             "status": r["status"],
             "reason": r["reason"] or "Consultation",
         })
@@ -762,11 +1219,17 @@ def get_doctor_dashboard(doctor_id):
 
 
 # ---------------------------------------------------------
-# PATIENT-SPECIFIC ENDPOINTS
+# PATIENT-SPECIFIC ENDPOINTS WITH OWNERSHIP CHECKS
 # ---------------------------------------------------------
 
 @app.route("/api/patient/dashboard/<int:patient_id>", methods=["GET"])
-def get_patient_dashboard(patient_id):
+@require_role("admin", "patient")
+def get_patient_dashboard(current_user, patient_id):
+    # Enforce patient authorization: Patients must NEVER access another patient's data
+    if current_user["role"] == "patient":
+        if current_user["patient_id"] and current_user["patient_id"] != patient_id:
+            return jsonify({"error": "Access Denied: You cannot view or access another patient's confidential health records."}), 403
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -774,7 +1237,18 @@ def get_patient_dashboard(patient_id):
     pat_row = cursor.fetchone()
     if not pat_row:
         conn.close()
-        return jsonify({"error": "Patient not found"}), 404
+        return jsonify({"error": "Patient record not found"}), 404
+
+    # Attending doctor details
+    cursor.execute("SELECT * FROM doctors WHERE id = ?", (pat_row["doctor_id"] or 1,))
+    doc_row = cursor.fetchone()
+    attending_doc = row_to_doctor_dict(doc_row) if doc_row else {
+        "id": 1,
+        "name": "Dr. Satya Deep",
+        "specialization": "Cardiology",
+        "email": "satya.deep@healthpulse.com",
+        "phone": "555-0101"
+    }
 
     # Appointments for this patient
     cursor.execute("""
@@ -792,8 +1266,8 @@ def get_patient_dashboard(patient_id):
             "doctor_name": r["doctor_name"],
             "doctor_specialization": r["doctor_specialization"],
             "doctor_phone": r["doctor_phone"],
-            "date": r["appointment_date"],
-            "time": r["appointment_time"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
             "status": r["status"],
             "reason": r["reason"] or "General Checkup",
         })
@@ -802,6 +1276,7 @@ def get_patient_dashboard(patient_id):
 
     return jsonify({
         "patient": row_to_patient_dict(pat_row),
+        "attending_doctor": attending_doc,
         "appointments": appointments
     })
 
@@ -841,7 +1316,7 @@ def add_patient():
     data = request.get_json(silent=True) or {}
 
     name = data.get("name", "").strip()
-    email = data.get("email", "").strip()
+    email = data.get("email", "").strip().lower()
 
     if not name or not email:
         return jsonify({"error": "Name and email are required"}), 400
@@ -868,12 +1343,26 @@ def add_patient():
 
     try:
         hashed_password = generate_password_hash(password)
+
+        # 1. Insert into central users table
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (email,))
+        existing_u = cursor.fetchone()
+        if existing_u:
+            user_id = existing_u["id"]
+        else:
+            cursor.execute("""
+                INSERT INTO users (name, email, password_hash, role, is_active)
+                VALUES (?, ?, ?, 'patient', 1)
+            """, (name, email, hashed_password))
+            user_id = cursor.lastrowid
+
+        # 2. Insert into patients table linked with user_id
         cursor.execute("""
             INSERT INTO patients (
-                name, weight, gender, age, email, password, disease,
+                user_id, name, weight, gender, age, email, password, disease,
                 doctor_id, doctor_name, doctor_specialization, role
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (name, weight, gender, age, email, hashed_password, disease, doc_id, doc_name, doc_spec, role))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, name, weight, gender, age, email, hashed_password, disease, doc_id, doc_name, doc_spec, role))
         new_id = cursor.lastrowid
         conn.commit()
 
@@ -885,7 +1374,7 @@ def add_patient():
         log_activity("PATIENT_REGISTERED", f"Patient {name} registered with condition: {disease}", "Patient", new_id)
 
         return jsonify({
-            "message": "added successfllyu",
+            "message": "added successfully",
             "patient": created_patient
         }), 201
 
@@ -933,6 +1422,11 @@ def update_patient(patient_id):
             doctor_specialization = ?, role = ?
         WHERE id = ?
     """, (name, weight, gender, age, email, password, disease, doc_id, doc_name, doc_spec, role, patient_id))
+
+    # Also sync name in users table if linked
+    if existing["user_id"]:
+        cursor.execute("UPDATE users SET name = ?, email = ? WHERE id = ?", (name, email, existing["user_id"]))
+
     conn.commit()
 
     cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
@@ -948,14 +1442,20 @@ def update_patient(patient_id):
 def delete_patient(patient_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM patients WHERE id = ?", (patient_id,))
+    cursor.execute("SELECT name, user_id FROM patients WHERE id = ?", (patient_id,))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return jsonify({"error": "Patient not found"}), 404
 
     patient_name = row["name"]
+    user_id = row["user_id"]
+
     cursor.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
+    if user_id:
+        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        cursor.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+
     conn.commit()
     conn.close()
 

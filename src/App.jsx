@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthProvider, useAuth } from './context/AuthContext.jsx'
 import ProtectedRoute from './components/auth/ProtectedRoute.jsx'
+import PublicRoute from './components/auth/PublicRoute.jsx'
 import PortalHub from './pages/auth/PortalHub.jsx'
 import AdminLogin from './pages/auth/AdminLogin.jsx'
 import DoctorLogin from './pages/auth/DoctorLogin.jsx'
@@ -17,7 +18,18 @@ import PatientDashboard from './pages/patient/PatientDashboard.jsx'
 import './App.css'
 
 function RootRedirect() {
-  const { isAuthenticated, role } = useAuth()
+  const { isAuthenticated, role, initialLoading } = useAuth()
+
+  if (initialLoading) {
+    return (
+      <div className="min-vh-100 d-flex justify-content-center align-items-center bg-light">
+        <div className="spinner-border text-primary" role="status">
+          <span className="visually-hidden">Loading session...</span>
+        </div>
+      </div>
+    )
+  }
+
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />
   }
@@ -43,11 +55,39 @@ export default function App() {
           {/* Root Redirect */}
           <Route path="/" element={<RootRedirect />} />
 
-          {/* Authentication Hub & Portals */}
-          <Route path="/login" element={<PortalHub />} />
-          <Route path="/admin/login" element={<AdminLogin />} />
-          <Route path="/doctor/login" element={<DoctorLogin />} />
-          <Route path="/patient/login" element={<PatientLogin />} />
+          {/* Authentication Hub & Portals (Wrapped with PublicRoute) */}
+          <Route
+            path="/login"
+            element={
+              <PublicRoute>
+                <PortalHub />
+              </PublicRoute>
+            }
+          />
+          <Route
+            path="/admin/login"
+            element={
+              <PublicRoute>
+                <AdminLogin />
+              </PublicRoute>
+            }
+          />
+          <Route
+            path="/doctor/login"
+            element={
+              <PublicRoute>
+                <DoctorLogin />
+              </PublicRoute>
+            }
+          />
+          <Route
+            path="/patient/login"
+            element={
+              <PublicRoute>
+                <PatientLogin />
+              </PublicRoute>
+            }
+          />
 
           {/* Admin Protected Routes with AdminLayout */}
           <Route
