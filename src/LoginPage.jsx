@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import axios from 'axios'
+import { API_BASE_URL } from './config.js'
 
 function LoginPage({ onLoginSuccess }) {
   const [email, setEmail] = useState('')
@@ -41,7 +42,7 @@ function LoginPage({ onLoginSuccess }) {
 
     // 2. Check against backend API
     try {
-      const res = await axios.post('https://doc-back.onrender.com/login', {
+      const res = await axios.post(`${API_BASE_URL}/login`, {
         email: cleanEmail,
         password: cleanPassword,
       })

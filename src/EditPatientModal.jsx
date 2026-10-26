@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
+import { API_BASE_URL } from './config.js'
 
 function EditPatientModal({ patient, isOpen, onClose, onPatientUpdated }) {
   const [formData, setFormData] = useState({
@@ -70,7 +71,7 @@ function EditPatientModal({ patient, isOpen, onClose, onPatientUpdated }) {
     setSubmitting(true)
     try {
       if (patient.id) {
-        await axios.put(`https://doc-back.onrender.com/patients/${patient.id}`, updatedPatient)
+        await axios.put(`${API_BASE_URL}/patients/${patient.id}`, updatedPatient)
       }
       onPatientUpdated(updatedPatient)
       onClose()

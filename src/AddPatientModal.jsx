@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import axios from 'axios'
+import { API_BASE_URL } from './config.js'
 
 function AddPatientModal({ isOpen, onClose, onPatientAdded }) {
   const initialForm = {
@@ -54,7 +55,7 @@ function AddPatientModal({ isOpen, onClose, onPatientAdded }) {
 
     setSubmitting(true)
     try {
-      await axios.post('https://doc-back.onrender.com/patients', newPatient)
+      await axios.post(`${API_BASE_URL}/patients`, newPatient)
       onPatientAdded(newPatient)
       setFormData(initialForm)
       onClose()

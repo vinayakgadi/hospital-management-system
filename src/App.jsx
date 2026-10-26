@@ -5,6 +5,7 @@ import AddPatientModal from './AddPatientModal.jsx'
 import EditPatientModal from './EditPatientModal.jsx'
 import DeleteConfirmModal from './DeleteConfirmModal.jsx'
 import LoginPage from './LoginPage.jsx'
+import { API_BASE_URL } from './config.js'
 
 function App() {
   const [currentUser, setCurrentUser] = useState(() => {
@@ -41,7 +42,7 @@ function App() {
     setLoading(true)
     setError(null)
     axios
-      .get('https://doc-back.onrender.com/patients')
+      .get(`${API_BASE_URL}/patients`)
       .then((res) => {
         setPatients(Array.isArray(res.data) ? res.data : [])
         setLoading(false)
@@ -83,7 +84,7 @@ function App() {
     setIsDeleting(true)
     try {
       if (patient.id) {
-        await axios.delete(`https://doc-back.onrender.com/patients/${patient.id}`)
+        await axios.delete(`${API_BASE_URL}/patients/${patient.id}`)
       }
       setPatients((prev) => prev.filter((p) => p.id !== patient.id))
       showToast(`Patient record for "${patient.name}" has been deleted.`, 'danger')
