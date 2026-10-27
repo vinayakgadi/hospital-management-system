@@ -13,7 +13,17 @@ import AdminPatients from './pages/admin/AdminPatients.jsx'
 import AdminDoctors from './pages/admin/AdminDoctors.jsx'
 import AdminAppointments from './pages/admin/AdminAppointments.jsx'
 import AdminPlaceholder from './pages/admin/AdminPlaceholder.jsx'
+import DoctorLayout from './components/doctor/DoctorLayout.jsx'
 import DoctorDashboard from './pages/doctor/DoctorDashboard.jsx'
+import DoctorPatients from './pages/doctor/DoctorPatients.jsx'
+import DoctorPatientDetails from './pages/doctor/DoctorPatientDetails.jsx'
+import DoctorAppointments from './pages/doctor/DoctorAppointments.jsx'
+import DoctorMedicalRecords from './pages/doctor/DoctorMedicalRecords.jsx'
+import DoctorPrescriptions from './pages/doctor/DoctorPrescriptions.jsx'
+import DoctorSchedule from './pages/doctor/DoctorSchedule.jsx'
+import DoctorProfile from './pages/doctor/DoctorProfile.jsx'
+import DoctorNotifications from './pages/doctor/DoctorNotifications.jsx'
+import DoctorSettings from './pages/doctor/DoctorSettings.jsx'
 import PatientDashboard from './pages/patient/PatientDashboard.jsx'
 import './App.css'
 
@@ -110,15 +120,27 @@ export default function App() {
             <Route path="settings" element={<AdminPlaceholder />} />
           </Route>
 
-          {/* Doctor Protected Route */}
+          {/* Doctor Protected Routes with DoctorLayout */}
           <Route
-            path="/doctor/dashboard"
+            path="/doctor"
             element={
               <ProtectedRoute allowedRoles={['doctor']}>
-                <DoctorDashboard />
+                <DoctorLayout />
               </ProtectedRoute>
             }
-          />
+          >
+            <Route index element={<Navigate to="/doctor/dashboard" replace />} />
+            <Route path="dashboard" element={<DoctorDashboard />} />
+            <Route path="patients" element={<DoctorPatients />} />
+            <Route path="patients/:id" element={<DoctorPatientDetails />} />
+            <Route path="appointments" element={<DoctorAppointments />} />
+            <Route path="medical-records" element={<DoctorMedicalRecords />} />
+            <Route path="prescriptions" element={<DoctorPrescriptions />} />
+            <Route path="schedule" element={<DoctorSchedule />} />
+            <Route path="profile" element={<DoctorProfile />} />
+            <Route path="notifications" element={<DoctorNotifications />} />
+            <Route path="settings" element={<DoctorSettings />} />
+          </Route>
 
           {/* Patient Protected Route */}
           <Route

@@ -99,3 +99,25 @@
 .animate-pulse-ring {
   animation: pulse-ring 2s infinite;
 }
+
+/* Print Styles for Official Prescriptions */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #rx-print-area, #rx-print-area * {
+    visibility: visible;
+  }
+  #rx-print-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 20px !important;
+    background: #ffffff !important;
+  }
+  .modal-backdrop, .modal-header, .modal-footer, header, aside, .sidebar-nav {
+    display: none !important;
+  }
+}
