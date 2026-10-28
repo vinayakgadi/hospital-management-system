@@ -160,25 +160,41 @@ export default function MedicalRecords() {
     setIsFormOpen(true)
   }
 
-  const handleOpenEditModal = (rec) => {
-    setEditingRecord(rec)
+  const handleOpenEditModal = async (rec) => {
+    try {
+      const data = await medicalRecordsService.getRecordById(rec.id)
+      setEditingRecord(data.record || rec)
+    } catch {
+      setEditingRecord(rec)
+    }
     setIsFormOpen(true)
   }
 
   const handleFormSubmit = async (formData) => {
     try {
       setIsSubmittingForm(true)
+      let savedRecord = null
       if (editingRecord && editingRecord.id) {
-        await medicalRecordsService.updateRecord(editingRecord.id, formData)
-        showToast(`Medical record #MR-${editingRecord.id} successfully updated!`)
+        const res = await medicalRecordsService.updateRecord(editingRecord.id, formData)
+        savedRecord = res.record
+        const formattedNum = `MR-${editingRecord.id.toString().padStart(4, '0')}`
+        showToast(`Medical record #${formattedNum} successfully saved as ${formData.status}!`)
       } else {
-        await medicalRecordsService.createRecord(formData)
+        const res = await medicalRecordsService.createRecord(formData)
+        savedRecord = res.record
         showToast(`New medical record successfully created as ${formData.status}!`)
       }
       setIsFormOpen(false)
       setEditingRecord(null)
       fetchStats()
       fetchRecords()
+
+      // If details modal was open for this record, refresh its view immediately
+      if (selectedRecordDetail && savedRecord && selectedRecordDetail.id === savedRecord.id) {
+        const detailData = await medicalRecordsService.getRecordById(savedRecord.id)
+        setSelectedRecordDetail(detailData.record)
+        setRecordLabs(detailData.lab_results || [])
+      }
     } catch (err) {
       console.error('Failed to save medical record:', err)
       showToast(err.response?.data?.error || 'Failed to save medical record.', 'danger')
@@ -209,11 +225,16 @@ export default function MedicalRecords() {
     if (!confirmFinalizeId) return
     try {
       setFinalizing(true)
-      await medicalRecordsService.finalizeRecord(confirmFinalizeId)
-      showToast(`Medical record #MR-${confirmFinalizeId} is now finalized and authenticated!`)
+      const res = await medicalRecordsService.finalizeRecord(confirmFinalizeId, {
+        reason: 'Clinical encounter authenticated and finalized by authorized administrator.',
+      })
+      const formattedNum = `MR-${confirmFinalizeId.toString().padStart(4, '0')}`
+      showToast(`Medical record #${formattedNum} is now authenticated and finalized!`)
       setConfirmFinalizeId(null)
       if (isDetailsOpen && selectedRecordDetail?.id === confirmFinalizeId) {
-        setIsDetailsOpen(false)
+        const detailData = await medicalRecordsService.getRecordById(confirmFinalizeId)
+        setSelectedRecordDetail(detailData.record)
+        setRecordLabs(detailData.lab_results || [])
       }
       fetchStats()
       fetchRecords()

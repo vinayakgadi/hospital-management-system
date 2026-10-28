@@ -247,12 +247,46 @@ def init_db():
         cursor.execute("ALTER TABLE medical_records ADD COLUMN updated_at TIMESTAMP")
     if "finalized_at" not in mr_cols:
         cursor.execute("ALTER TABLE medical_records ADD COLUMN finalized_at TIMESTAMP")
+    if "appointment_id" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN appointment_id INTEGER")
+    if "review_required" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN review_required INTEGER DEFAULT 0")
+    if "review_reason" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN review_reason TEXT DEFAULT ''")
+    if "is_amended" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN is_amended INTEGER DEFAULT 0")
+    if "amended_at" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN amended_at TIMESTAMP")
+    if "amended_by" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN amended_by TEXT DEFAULT ''")
 
     # Safe indexes for medical_records
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_patient ON medical_records(patient_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_doctor ON medical_records(doctor_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_date ON medical_records(consultation_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_status ON medical_records(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_apt ON medical_records(appointment_id)")
+
+    # 13. Medical Record Amendments Table (Clinical Audit Trail)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS medical_record_amendments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL,
+            amended_by_user_id INTEGER,
+            amended_by_name TEXT NOT NULL,
+            amended_by_role TEXT NOT NULL,
+            previous_doctor_id INTEGER,
+            previous_doctor_name TEXT,
+            new_doctor_id INTEGER,
+            new_doctor_name TEXT,
+            previous_data TEXT NOT NULL,
+            amendment_reason TEXT NOT NULL,
+            changes_summary TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (record_id) REFERENCES medical_records(id) ON DELETE CASCADE
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mra_record ON medical_record_amendments(record_id)")
 
     # 12. Lab Results & Medical Documents Table
     cursor.execute("""
@@ -633,9 +667,39 @@ def row_to_medical_record_dict(row):
         "follow_up_date": row["follow_up_date"] or "",
         "follow_up_notes": row["follow_up_notes"] if ("follow_up_notes" in row_keys and row["follow_up_notes"]) else "",
         "status": row["status"] if ("status" in row_keys and row["status"]) else "Finalized",
+        "appointment_id": row["appointment_id"] if "appointment_id" in row_keys else None,
+        "review_required": bool(row["review_required"]) if "review_required" in row_keys and row["review_required"] is not None else False,
+        "review_reason": row["review_reason"] if ("review_reason" in row_keys and row["review_reason"]) else "",
+        "is_amended": bool(row["is_amended"]) if "is_amended" in row_keys and row["is_amended"] is not None else False,
+        "amended_at": row["amended_at"] if "amended_at" in row_keys else None,
+        "amended_by": row["amended_by"] if "amended_by" in row_keys else "",
         "created_at": row["created_at"],
         "updated_at": row["updated_at"] if ("updated_at" in row_keys and row["updated_at"]) else row["created_at"],
         "finalized_at": row["finalized_at"] if ("finalized_at" in row_keys and row["finalized_at"]) else (row["created_at"] if (row["status"] if "status" in row_keys else "Finalized") == "Finalized" else None),
+    }
+
+
+def row_to_amendment_dict(row):
+    prev_data = row["previous_data"]
+    if prev_data and isinstance(prev_data, str) and prev_data.strip().startswith("{"):
+        try:
+            prev_data = json.loads(prev_data)
+        except Exception:
+            pass
+    return {
+        "id": row["id"],
+        "record_id": row["record_id"],
+        "amended_by_user_id": row["amended_by_user_id"],
+        "amended_by_name": row["amended_by_name"],
+        "amended_by_role": row["amended_by_role"],
+        "previous_doctor_id": row["previous_doctor_id"],
+        "previous_doctor_name": row["previous_doctor_name"] or f"Doctor #{row['previous_doctor_id']}",
+        "new_doctor_id": row["new_doctor_id"],
+        "new_doctor_name": row["new_doctor_name"] or f"Doctor #{row['new_doctor_id']}",
+        "previous_data": prev_data,
+        "amendment_reason": row["amendment_reason"],
+        "changes_summary": row["changes_summary"] or "",
+        "created_at": row["created_at"],
     }
 
 
@@ -1953,6 +2017,20 @@ def get_medical_records_stats(current_user):
         cursor.execute("SELECT COUNT(*) FROM medical_records WHERE status = 'Finalized' OR status IS NULL OR status = ''")
     finalized_records = cursor.fetchone()[0]
 
+    # Amended records count
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND is_amended = 1", params)
+    else:
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE is_amended = 1")
+    amended_records = cursor.fetchone()[0]
+
+    # Review required count
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND review_required = 1", params)
+    else:
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE review_required = 1")
+    review_required_records = cursor.fetchone()[0]
+
     conn.close()
 
     return jsonify({
@@ -1960,6 +2038,8 @@ def get_medical_records_stats(current_user):
         "created_this_month": created_this_month,
         "draft_records": draft_records,
         "finalized_records": finalized_records,
+        "amended_records": amended_records,
+        "review_required_records": review_required_records,
     })
 
 
@@ -2003,6 +2083,12 @@ def get_medical_records_collection(current_user):
     if status_filter and status_filter != "ALL":
         if status_filter == "Finalized":
             where_clauses.append("(mr.status = 'Finalized' OR mr.status IS NULL OR mr.status = '')")
+        elif status_filter == "Draft":
+            where_clauses.append("mr.status = 'Draft'")
+        elif status_filter == "Amended":
+            where_clauses.append("mr.is_amended = 1")
+        elif status_filter == "ReviewRequired":
+            where_clauses.append("mr.review_required = 1")
         else:
             where_clauses.append("mr.status = ?")
             params.append(status_filter)
@@ -2120,13 +2206,62 @@ def get_medical_record_detail(current_user, record_id):
     rx_rows = cursor.fetchall()
     prescriptions = [row_to_prescription_dict(pr) for pr in rx_rows]
 
+    # Clinical Amendment History Audit Trail
+    cursor.execute("""
+        SELECT * FROM medical_record_amendments
+        WHERE record_id = ?
+        ORDER BY created_at DESC, id DESC
+    """, (record_id,))
+    amendment_rows = cursor.fetchall()
+    amendments = [row_to_amendment_dict(ar) for ar in amendment_rows]
+
+    # Associated appointment (if linked)
+    associated_appointment = None
+    if row["appointment_id"]:
+        cursor.execute("""
+            SELECT a.*, d.name as doctor_name, d.specialization as doctor_specialization
+            FROM appointments a
+            LEFT JOIN doctors d ON a.doctor_id = d.id
+            WHERE a.id = ?
+        """, (row["appointment_id"],))
+        apt_row = cursor.fetchone()
+        if apt_row:
+            associated_appointment = {
+                "id": apt_row["id"],
+                "doctor_id": apt_row["doctor_id"],
+                "doctor_name": apt_row["doctor_name"],
+                "doctor_specialization": apt_row["doctor_specialization"],
+                "appointment_date": apt_row["appointment_date"],
+                "appointment_time": apt_row["appointment_time"],
+                "status": apt_row["status"],
+                "reason": apt_row["reason"]
+            }
+
     conn.close()
 
     return jsonify({
         "record": record,
         "lab_results": lab_results,
         "prescriptions": prescriptions,
+        "amendments": amendments,
+        "associated_appointment": associated_appointment,
     })
+
+
+@app.route("/api/medical-records/<int:record_id>/amendments", methods=["GET"])
+@require_role("admin", "doctor")
+def get_medical_record_amendments_endpoint(current_user, record_id):
+    """Retrieves full amendment history audit trail for a clinical record."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM medical_record_amendments
+        WHERE record_id = ?
+        ORDER BY created_at DESC, id DESC
+    """, (record_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return jsonify([row_to_amendment_dict(r) for r in rows])
 
 
 @app.route("/api/medical-records", methods=["POST"])
@@ -2147,6 +2282,7 @@ def create_medical_record_entry(current_user):
     consultation_time = (data.get("consultation_time") or datetime.now().strftime("%I:%M %p")).strip()
     follow_up_date = (data.get("follow_up_date") or "").strip()
     follow_up_notes = (data.get("follow_up_notes") or "").strip()
+    appointment_id = data.get("appointment_id")
     status = (data.get("status") or "Finalized").strip()
     if status not in ["Draft", "Finalized"]:
         status = "Finalized"
@@ -2155,11 +2291,13 @@ def create_medical_record_entry(current_user):
     vitals = data.get("vital_signs", {})
     vital_signs_str = json.dumps(vitals) if isinstance(vitals, dict) else str(vitals)
 
-    # Doctor assignment
+    # Doctor assignment validation
     if current_user["role"] == "doctor":
-        doctor_id = current_user.get("doctor_id") or 1
+        doctor_id = current_user.get("doctor_id")
+        if not doctor_id:
+            return jsonify({"error": "No associated doctor profile found for current user."}), 400
     elif not doctor_id:
-        doctor_id = 1
+        return jsonify({"error": "Attending physician must be selected. Please choose a doctor."}), 400
 
     if not patient_id:
         return jsonify({"error": "Please select a patient."}), 400
@@ -2177,11 +2315,19 @@ def create_medical_record_entry(current_user):
         return jsonify({"error": "Selected patient does not exist."}), 404
 
     # Validate doctor
-    cursor.execute("SELECT id, name FROM doctors WHERE id = ?", (doctor_id,))
+    cursor.execute("SELECT id, name, status, specialization FROM doctors WHERE id = ?", (doctor_id,))
     doc = cursor.fetchone()
     if not doc:
         conn.close()
         return jsonify({"error": "Selected doctor does not exist."}), 404
+    if doc["status"] != "Active":
+        conn.close()
+        return jsonify({"error": f"Doctor {doc['name']} is currently Inactive and cannot be assigned to new consultations."}), 400
+
+    if appointment_id:
+        cursor.execute("SELECT id FROM appointments WHERE id = ?", (appointment_id,))
+        if not cursor.fetchone():
+            appointment_id = None
 
     finalized_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if status == "Finalized" else None
 
@@ -2190,20 +2336,20 @@ def create_medical_record_entry(current_user):
             patient_id, doctor_id, consultation_date, consultation_time, visit_type,
             visit_reason, symptoms, observations, vital_signs, diagnosis,
             treatment_plan, clinical_notes, follow_up_date, follow_up_notes,
-            status, finalized_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, finalized_at, appointment_id, review_required, review_reason, is_amended
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 0)
     """, (
         patient_id, doctor_id, consultation_date, consultation_time, visit_type,
         visit_reason, symptoms, observations, vital_signs_str, diagnosis,
         treatment_plan, clinical_notes, follow_up_date, follow_up_notes,
-        status, finalized_at
+        status, finalized_at, appointment_id
     ))
     new_id = cursor.lastrowid
     conn.commit()
 
     log_activity(
         "MEDICAL_RECORD_CREATED",
-        f"Medical Record #{new_id} ({status}) documented for {pat['name']}: {diagnosis}",
+        f"Medical Record #{new_id} ({status}) documented by {doc['name']} for {pat['name']}: {diagnosis}",
         "MedicalRecord",
         new_id,
         current_user["name"],
@@ -2240,7 +2386,7 @@ def create_medical_record_entry(current_user):
 @app.route("/api/medical-records/<int:record_id>", methods=["PUT"])
 @require_role("admin", "doctor")
 def update_medical_record_entry(current_user, record_id):
-    """Updates an existing medical record with controlled amendment tracking."""
+    """Updates an existing medical record with controlled amendment tracking and audit log."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -2270,6 +2416,22 @@ def update_medical_record_entry(current_user, record_id):
     follow_up_notes = data.get("follow_up_notes", existing["follow_up_notes"] or "")
     doctor_id = data.get("doctor_id", existing["doctor_id"])
 
+    # Validate target doctor
+    cursor.execute("SELECT id, name, status, specialization FROM doctors WHERE id = ?", (doctor_id,))
+    doc = cursor.fetchone()
+    if not doc:
+        conn.close()
+        return jsonify({"error": "Selected doctor does not exist."}), 404
+    if doc["status"] != "Active" and int(doctor_id) != int(existing["doctor_id"]) and current_user["role"] != "admin":
+        conn.close()
+        return jsonify({"error": f"Doctor {doc['name']} is currently Inactive and cannot be assigned."}), 400
+
+    # Retrieve previous doctor details
+    cursor.execute("SELECT name, specialization FROM doctors WHERE id = ?", (existing["doctor_id"],))
+    prev_doc_row = cursor.fetchone()
+    prev_doc_name = prev_doc_row["name"] if prev_doc_row else f"Doctor #{existing['doctor_id']}"
+    new_doc_name = doc["name"]
+
     vitals = data.get("vital_signs")
     if vitals is not None:
         vital_signs_str = json.dumps(vitals) if isinstance(vitals, dict) else str(vitals)
@@ -2277,12 +2439,78 @@ def update_medical_record_entry(current_user, record_id):
         vital_signs_str = existing["vital_signs"]
 
     new_status = data.get("status", existing["status"] or "Finalized")
-    was_draft = existing["status"] == "Draft"
+    if new_status not in ["Draft", "Finalized"]:
+        new_status = "Finalized"
+
+    was_finalized = (existing["status"] or "Finalized") == "Finalized"
     is_now_final = new_status == "Finalized"
 
+    # Track distinct clinical changes
+    changes = []
+    if int(doctor_id) != int(existing["doctor_id"]):
+        changes.append(f"Attending physician changed from {prev_doc_name} to {new_doc_name}")
+    if diagnosis != (existing["diagnosis"] or "").strip():
+        changes.append("Primary diagnosis updated")
+    if symptoms != (existing["symptoms"] or ""):
+        changes.append("Symptoms updated")
+    if observations != (existing["observations"] or ""):
+        changes.append("Observations updated")
+    if treatment_plan != (existing["treatment_plan"] or ""):
+        changes.append("Treatment plan updated")
+    if clinical_notes != (existing["clinical_notes"] or ""):
+        changes.append("Clinical notes updated")
+    if consultation_date != existing["consultation_date"]:
+        changes.append(f"Consultation date changed to {consultation_date}")
+    if consultation_time != (existing["consultation_time"] or ""):
+        changes.append(f"Consultation time changed to {consultation_time}")
+    if visit_type != (existing["visit_type"] or ""):
+        changes.append(f"Visit type changed to {visit_type}")
+    if visit_reason != (existing["visit_reason"] or ""):
+        changes.append("Visit reason updated")
+
+    amendment_reason = (data.get("amendment_reason") or data.get("reason") or "").strip()
+    is_amended = existing["is_amended"] or 0
+    amended_at = existing["amended_at"]
+    amended_by = existing["amended_by"] or ""
+
+    # Record amendment entry if this was a finalized record being modified
+    if was_finalized and (changes or amendment_reason):
+        if not amendment_reason:
+            amendment_reason = "Clinical documentation correction and attending physician reassignment"
+        prev_snapshot = json.dumps(dict(existing), default=str)
+        changes_summary = "; ".join(changes) if changes else "Clinical record verified and re-finalized"
+        cursor.execute("""
+            INSERT INTO medical_record_amendments (
+                record_id, amended_by_user_id, amended_by_name, amended_by_role,
+                previous_doctor_id, previous_doctor_name, new_doctor_id, new_doctor_name,
+                previous_data, amendment_reason, changes_summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            record_id, current_user["id"], current_user["name"], current_user["role"].capitalize(),
+            existing["doctor_id"], prev_doc_name, doctor_id, new_doc_name,
+            prev_snapshot, amendment_reason, changes_summary
+        ))
+        is_amended = 1
+        amended_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        amended_by = current_user["name"]
+
     finalized_at = existing["finalized_at"]
-    if was_draft and is_now_final:
+    if is_now_final:
         finalized_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elif new_status == "Draft":
+        # Keep original finalized timestamp in amendment record, but clear for active draft
+        finalized_at = None
+
+    # Handle review resolution
+    resolve_review = data.get("resolve_review", False) or is_now_final
+    if resolve_review:
+        review_required = 0
+        review_reason = ""
+    else:
+        review_required = data.get("review_required", existing["review_required"] or 0)
+        review_reason = data.get("review_reason", existing["review_reason"] or "")
+
+    appointment_id = data.get("appointment_id", existing["appointment_id"])
 
     cursor.execute("""
         UPDATE medical_records
@@ -2290,20 +2518,24 @@ def update_medical_record_entry(current_user, record_id):
             visit_reason = ?, symptoms = ?, observations = ?, vital_signs = ?,
             diagnosis = ?, treatment_plan = ?, clinical_notes = ?,
             follow_up_date = ?, follow_up_notes = ?, status = ?,
-            finalized_at = ?, updated_at = CURRENT_TIMESTAMP
+            finalized_at = ?, updated_at = CURRENT_TIMESTAMP,
+            appointment_id = ?, review_required = ?, review_reason = ?,
+            is_amended = ?, amended_at = ?, amended_by = ?
         WHERE id = ?
     """, (
         doctor_id, consultation_date, consultation_time, visit_type,
         visit_reason, symptoms, observations, vital_signs_str,
         diagnosis, treatment_plan, clinical_notes,
         follow_up_date, follow_up_notes, new_status,
-        finalized_at, record_id
+        finalized_at, appointment_id, review_required, review_reason,
+        is_amended, amended_at, amended_by, record_id
     ))
     conn.commit()
 
+    action_label = "FINALIZED" if is_now_final and not was_finalized else "AMENDED" if is_amended else "UPDATED"
     log_activity(
-        "MEDICAL_RECORD_UPDATED" if not (was_draft and is_now_final) else "MEDICAL_RECORD_FINALIZED",
-        f"Medical Record #{record_id} ({new_status}) updated by {current_user['name']}",
+        f"MEDICAL_RECORD_{action_label}",
+        f"Medical Record #{record_id} ({new_status}) updated by {current_user['name']} with attending Dr. {new_doc_name}",
         "MedicalRecord",
         record_id,
         current_user["name"],
@@ -2324,7 +2556,7 @@ def update_medical_record_entry(current_user, record_id):
     conn.close()
 
     return jsonify({
-        "message": f"Medical record #{record_id} successfully updated.",
+        "message": f"Medical record #{record_id} successfully updated as {new_status}.",
         "record": row_to_medical_record_dict(updated_rec)
     })
 
@@ -2332,11 +2564,16 @@ def update_medical_record_entry(current_user, record_id):
 @app.route("/api/medical-records/<int:record_id>/finalize", methods=["PUT"])
 @require_role("admin", "doctor")
 def finalize_medical_record_action(current_user, record_id):
-    """Finalizes a draft medical record."""
+    """Finalizes a draft medical record or re-finalizes an amended record."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT * FROM medical_records WHERE id = ?", (record_id,))
+    cursor.execute("""
+        SELECT mr.*, d.name as doctor_name, d.status as doctor_status
+        FROM medical_records mr
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
     existing = cursor.fetchone()
     if not existing:
         conn.close()
@@ -2347,17 +2584,39 @@ def finalize_medical_record_action(current_user, record_id):
             conn.close()
             return jsonify({"error": "Access Denied: You may only finalize records you authored."}), 403
 
+    if existing["doctor_status"] != "Active" and current_user["role"] != "admin":
+        conn.close()
+        return jsonify({"error": f"Cannot finalize record: Attending doctor {existing['doctor_name']} is Inactive."}), 400
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = request.get_json(silent=True) or {}
+    amendment_reason = (data.get("reason") or data.get("amendment_reason") or "").strip()
+
+    # If re-finalizing an already amended or previously finalized record
+    if existing["is_amended"] and amendment_reason:
+        cursor.execute("""
+            INSERT INTO medical_record_amendments (
+                record_id, amended_by_user_id, amended_by_name, amended_by_role,
+                previous_doctor_id, previous_doctor_name, new_doctor_id, new_doctor_name,
+                previous_data, amendment_reason, changes_summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            record_id, current_user["id"], current_user["name"], current_user["role"].capitalize(),
+            existing["doctor_id"], existing["doctor_name"], existing["doctor_id"], existing["doctor_name"],
+            json.dumps(dict(existing), default=str), amendment_reason, "Record authenticated and finalized by authorized administrator."
+        ))
+
     cursor.execute("""
         UPDATE medical_records
-        SET status = 'Finalized', finalized_at = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = 'Finalized', finalized_at = ?, updated_at = CURRENT_TIMESTAMP,
+            review_required = 0, review_reason = ''
         WHERE id = ?
     """, (now_str, record_id))
     conn.commit()
 
     log_activity(
         "MEDICAL_RECORD_FINALIZED",
-        f"Medical Record #{record_id} finalized by {current_user['name']}",
+        f"Medical Record #{record_id} authenticated and finalized by {current_user['name']}",
         "MedicalRecord",
         record_id,
         current_user["name"],
@@ -2378,7 +2637,7 @@ def finalize_medical_record_action(current_user, record_id):
     conn.close()
 
     return jsonify({
-        "message": f"Medical record #{record_id} is now finalized.",
+        "message": f"Medical record #{record_id} is now authenticated and finalized.",
         "record": row_to_medical_record_dict(updated_rec)
     })
 

@@ -12,6 +12,7 @@ import {
   Save,
   CheckCircle,
   AlertCircle,
+  ShieldAlert,
 } from 'lucide-react'
 
 export default function MedicalRecordForm({
@@ -24,6 +25,7 @@ export default function MedicalRecordForm({
   isSubmitting = false,
 }) {
   const isEditing = Boolean(initialData && initialData.id)
+  const isPreviouslyFinalized = isEditing && initialData?.status === 'Finalized'
 
   const [formData, setFormData] = useState({
     patient_id: '',
@@ -51,11 +53,52 @@ export default function MedicalRecordForm({
   })
 
   const [selectedPatient, setSelectedPatient] = useState(null)
+  const [selectedDoctor, setSelectedDoctor] = useState(null)
+  const [amendmentReason, setAmendmentReason] = useState('')
   const [formError, setFormError] = useState(null)
 
   // Initialize or populate form
   useEffect(() => {
+    if (!isOpen) return
+
     if (initialData) {
+      // 1. Parsing vital signs reliably
+      let initialVitals = {
+        blood_pressure: '120/80',
+        heart_rate: '72',
+        temperature: '98.6',
+        respiratory_rate: '16',
+        spo2: '98',
+        weight: '',
+      }
+
+      if (initialData.vital_signs) {
+        if (typeof initialData.vital_signs === 'object') {
+          initialVitals = {
+            blood_pressure: initialData.vital_signs.blood_pressure || initialData.vital_signs.bp || '120/80',
+            heart_rate: initialData.vital_signs.heart_rate || initialData.vital_signs.hr || '72',
+            temperature: initialData.vital_signs.temperature || initialData.vital_signs.temp || '98.6',
+            respiratory_rate: initialData.vital_signs.respiratory_rate || '16',
+            spo2: initialData.vital_signs.spo2 || '98',
+            weight: initialData.vital_signs.weight || '',
+          }
+        } else if (typeof initialData.vital_signs === 'string' && initialData.vital_signs.trim().startsWith('{')) {
+          try {
+            const parsed = JSON.parse(initialData.vital_signs)
+            initialVitals = {
+              blood_pressure: parsed.blood_pressure || parsed.bp || '120/80',
+              heart_rate: parsed.heart_rate || parsed.hr || '72',
+              temperature: parsed.temperature || parsed.temp || '98.6',
+              respiratory_rate: parsed.respiratory_rate || '16',
+              spo2: parsed.spo2 || '98',
+              weight: parsed.weight || '',
+            }
+          } catch {
+            // Keep default
+          }
+        }
+      }
+
       setFormData({
         patient_id: initialData.patient_id || '',
         doctor_id: initialData.doctor_id || '',
@@ -65,27 +108,31 @@ export default function MedicalRecordForm({
         visit_reason: initialData.visit_reason || '',
         symptoms: initialData.symptoms || '',
         observations: initialData.observations || '',
-        vital_signs: {
-          blood_pressure: initialData.vital_signs?.blood_pressure || initialData.vital_signs?.bp || '120/80',
-          heart_rate: initialData.vital_signs?.heart_rate || initialData.vital_signs?.hr || '72',
-          temperature: initialData.vital_signs?.temperature || initialData.vital_signs?.temp || '98.6',
-          respiratory_rate: initialData.vital_signs?.respiratory_rate || '16',
-          spo2: initialData.vital_signs?.spo2 || '98',
-          weight: initialData.vital_signs?.weight || '',
-        },
+        vital_signs: initialVitals,
         diagnosis: initialData.diagnosis || '',
         treatment_plan: initialData.treatment_plan || '',
         clinical_notes: initialData.clinical_notes || '',
         follow_up_date: initialData.follow_up_date || '',
         follow_up_notes: initialData.follow_up_notes || '',
         status: initialData.status || 'Draft',
+        appointment_id: initialData.appointment_id || null,
+        resolve_review: Boolean(initialData.review_required),
       })
-      const found = patients.find((p) => p.id === initialData.patient_id)
-      setSelectedPatient(found || null)
+
+      const foundPat = patients.find((p) => p.id === initialData.patient_id)
+      setSelectedPatient(foundPat || null)
+
+      const foundDoc = doctors.find((d) => d.id === initialData.doctor_id)
+      setSelectedDoctor(foundDoc || null)
+      setAmendmentReason('')
     } else {
+      // Creating a new medical record
+      // Find first active doctor if available
+      const firstActiveDoctor = doctors.find((d) => d.status === 'Active') || (doctors.length > 0 ? doctors[0] : null)
+
       setFormData({
         patient_id: patients.length > 0 ? patients[0].id : '',
-        doctor_id: doctors.length > 0 ? doctors[0].id : '',
+        doctor_id: firstActiveDoctor ? firstActiveDoctor.id : '',
         consultation_date: new Date().toISOString().split('T')[0],
         consultation_time: '10:00 AM',
         visit_type: 'In-Person',
@@ -110,18 +157,40 @@ export default function MedicalRecordForm({
       if (patients.length > 0) {
         setSelectedPatient(patients[0])
       }
+      setSelectedDoctor(firstActiveDoctor || null)
+      setAmendmentReason('')
     }
     setFormError(null)
   }, [initialData, patients, doctors, isOpen])
 
+  // Handle patient selection (only permitted when creating new record)
   const handlePatientSelect = (patientId) => {
     const pId = parseInt(patientId, 10)
     setFormData((prev) => ({ ...prev, patient_id: pId }))
     const found = patients.find((p) => p.id === pId)
     setSelectedPatient(found || null)
-    if (found && found.doctor_id) {
-      setFormData((prev) => ({ ...prev, doctor_id: found.doctor_id }))
+
+    // Suggest patient's primary doctor if active and currently unselected
+    if (found && found.doctor_id && !formData.doctor_id) {
+      const doc = doctors.find((d) => d.id === found.doctor_id)
+      if (doc && doc.status === 'Active') {
+        setFormData((prev) => ({ ...prev, doctor_id: doc.id }))
+        setSelectedDoctor(doc)
+      }
     }
+  }
+
+  // Handle doctor selection
+  const handleDoctorSelect = (doctorIdStr) => {
+    if (!doctorIdStr) {
+      setFormData((prev) => ({ ...prev, doctor_id: '' }))
+      setSelectedDoctor(null)
+      return
+    }
+    const dId = parseInt(doctorIdStr, 10)
+    setFormData((prev) => ({ ...prev, doctor_id: dId }))
+    const foundDoc = doctors.find((d) => d.id === dId)
+    setSelectedDoctor(foundDoc || null)
   }
 
   const handleVitalChange = (field, value) => {
@@ -139,8 +208,25 @@ export default function MedicalRecordForm({
       setFormError('Please select a valid patient.')
       return
     }
+    if (!formData.doctor_id) {
+      setFormError('Attending physician must be selected. Please choose a doctor.')
+      return
+    }
+
+    const doc = doctors.find((d) => d.id === parseInt(formData.doctor_id, 10))
+    if (doc && doc.status !== 'Active') {
+      setFormError(`Doctor ${doc.name} is currently Inactive. Please select an active attending physician.`)
+      return
+    }
+
     if (!formData.diagnosis || !formData.diagnosis.trim()) {
       setFormError('Clinical Diagnosis is required.')
+      return
+    }
+
+    // Require amendment reason if modifying a finalized record
+    if (isPreviouslyFinalized && !amendmentReason.trim()) {
+      setFormError('Please provide an Amendment Reason explaining the changes to this finalized clinical record.')
       return
     }
 
@@ -148,6 +234,7 @@ export default function MedicalRecordForm({
     const payload = {
       ...formData,
       status: targetStatus,
+      amendment_reason: amendmentReason.trim(),
     }
     onSubmit(payload)
   }
@@ -173,11 +260,13 @@ export default function MedicalRecordForm({
               </div>
               <div>
                 <h5 className="modal-title fw-bold text-dark mb-0">
-                  {isEditing ? `Edit Medical Record (#MR-${initialData.id})` : 'New Electronic Medical Record (EMR)'}
+                  {isEditing ? `Edit Medical Record (#MR-${initialData.id.toString().padStart(4, '0')})` : 'New Electronic Medical Record (EMR)'}
                 </h5>
                 <small className="text-muted">
-                  {isEditing
-                    ? 'Update clinical encounter details and diagnostic observations'
+                  {isPreviouslyFinalized
+                    ? 'Clinical Amendment Workflow — Correct physician assignments and verified medical details'
+                    : isEditing
+                    ? 'Update clinical encounter details, vitals, and diagnostic observations'
                     : 'Document clinical consultation, vitals, diagnosis, and treatment plan'}
                 </small>
               </div>
@@ -200,6 +289,36 @@ export default function MedicalRecordForm({
               </div>
             )}
 
+            {/* Alert for previously finalized record amendment */}
+            {isPreviouslyFinalized && (
+              <div className="alert alert-warning border border-warning rounded-4 p-3.5 mb-4 bg-warning-subtle text-dark">
+                <div className="d-flex align-items-start gap-2.5">
+                  <ShieldAlert size={20} className="text-warning-emphasis flex-shrink-0 mt-0.5" />
+                  <div className="w-100">
+                    <strong className="d-block text-warning-emphasis fw-bold mb-1">
+                      Controlled Clinical Amendment Mode
+                    </strong>
+                    <p className="small text-muted mb-2">
+                      This medical record is currently marked as <strong>Finalized</strong>. All corrections (including doctor re-assignments, vitals, and diagnostic revisions) will be recorded in the clinical amendment audit trail along with your justification.
+                    </p>
+                    <div>
+                      <label className="form-label small fw-bold text-dark mb-1">
+                        Reason for Amendment / Physician Reassignment *
+                      </label>
+                      <textarea
+                        className="form-control"
+                        rows="2"
+                        placeholder="e.g. Corrected attending physician to Dr. Teja based on Dialysis Review encounter #6; updated vital sign baseline..."
+                        value={amendmentReason}
+                        onChange={(e) => setAmendmentReason(e.target.value)}
+                        required
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="row g-4">
               {/* Left Column: Patient & Consultation Logistics */}
               <div className="col-12 col-lg-5">
@@ -211,7 +330,9 @@ export default function MedicalRecordForm({
                   </h6>
 
                   <div className="mb-3">
-                    <label className="form-label small fw-semibold text-dark">Select Patient *</label>
+                    <label className="form-label small fw-semibold text-dark">
+                      Select Patient {isEditing ? '(Locked for Editing)' : '*'}
+                    </label>
                     <select
                       className="form-select"
                       value={formData.patient_id}
@@ -269,12 +390,57 @@ export default function MedicalRecordForm({
                   </div>
                 </div>
 
-                {/* Consultation Logistics */}
+                {/* Consultation Logistics & Doctor Selection */}
                 <div className="card border rounded-4 p-3.5 bg-light-subtle">
                   <h6 className="fw-bold text-dark mb-3 d-flex align-items-center gap-1.5">
                     <Stethoscope size={16} className="text-primary" />
-                    <span>Consultation Logistics</span>
+                    <span>Attending Physician & Logistics</span>
                   </h6>
+
+                  {/* Attending Physician Selection */}
+                  <div className="mb-3">
+                    <label className="form-label small fw-semibold text-dark">
+                      Attending Physician *
+                    </label>
+                    <select
+                      className="form-select"
+                      value={formData.doctor_id}
+                      onChange={(e) => handleDoctorSelect(e.target.value)}
+                      required
+                    >
+                      <option value="">-- Choose Attending Doctor --</option>
+                      {doctors.map((d) => {
+                        const isInactive = d.status !== 'Active'
+                        return (
+                          <option key={d.id} value={d.id}>
+                            {d.name} — {d.specialization} {isInactive ? '(Inactive)' : ''}
+                          </option>
+                        )
+                      })}
+                    </select>
+
+                    {/* Selected Doctor Summary Card */}
+                    {selectedDoctor && (
+                      <div className="mt-2 p-2.5 rounded-3 bg-white border small">
+                        <div className="d-flex justify-content-between align-items-center mb-1">
+                          <span className="text-muted">Specialization:</span>
+                          <strong className="text-dark">{selectedDoctor.specialization}</strong>
+                        </div>
+                        <div className="d-flex justify-content-between align-items-center">
+                          <span className="text-muted">Status:</span>
+                          <span
+                            className={`badge ${
+                              selectedDoctor.status === 'Active'
+                                ? 'bg-success-subtle text-success border border-success-subtle'
+                                : 'bg-danger-subtle text-danger border border-danger-subtle'
+                            }`}
+                          >
+                            {selectedDoctor.status}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
 
                   <div className="row g-2.5 mb-3">
                     <div className="col-12 col-sm-6">
@@ -297,23 +463,6 @@ export default function MedicalRecordForm({
                         onChange={(e) => setFormData({ ...formData, consultation_time: e.target.value })}
                       />
                     </div>
-                  </div>
-
-                  <div className="mb-3">
-                    <label className="form-label small fw-semibold text-dark">Attending Physician *</label>
-                    <select
-                      className="form-select"
-                      value={formData.doctor_id}
-                      onChange={(e) => setFormData({ ...formData, doctor_id: parseInt(e.target.value, 10) })}
-                      required
-                    >
-                      <option value="">-- Choose Attending Doctor --</option>
-                      {doctors.map((d) => (
-                        <option key={d.id} value={d.id}>
-                          {d.name} ({d.specialization})
-                        </option>
-                      ))}
-                    </select>
                   </div>
 
                   <div className="mb-3">
@@ -504,11 +653,11 @@ export default function MedicalRecordForm({
                   </div>
 
                   <div>
-                    <label className="form-label small fw-semibold text-dark">Additional Physician Notes</label>
+                    <label className="form-label small fw-semibold text-dark">Additional Clinical Notes</label>
                     <input
                       type="text"
                       className="form-control"
-                      placeholder="e.g. Patient education provided regarding warning signs."
+                      placeholder="e.g. Patient education provided regarding lifestyle modifications and medication adherence."
                       value={formData.clinical_notes}
                       onChange={(e) => setFormData({ ...formData, clinical_notes: e.target.value })}
                     />
@@ -541,7 +690,7 @@ export default function MedicalRecordForm({
                 <span>Save as Draft</span>
               </button>
 
-              {/* Finalize Record */}
+              {/* Finalize Record / Re-Finalize Record */}
               <button
                 type="button"
                 className="btn btn-primary btn-sm rounded-3 px-4 d-flex align-items-center gap-1.5"
@@ -549,7 +698,13 @@ export default function MedicalRecordForm({
                 onClick={() => handleSubmit('Finalized')}
               >
                 <CheckCircle size={15} />
-                <span>{isSubmitting ? 'Saving...' : 'Finalize & Authenticate Record'}</span>
+                <span>
+                  {isSubmitting
+                    ? 'Saving...'
+                    : isPreviouslyFinalized
+                    ? 'Re-Finalize & Authenticate Record'
+                    : 'Finalize & Authenticate Record'}
+                </span>
               </button>
             </div>
           </div>

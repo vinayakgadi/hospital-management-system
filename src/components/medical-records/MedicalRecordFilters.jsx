@@ -50,6 +50,8 @@ export default function MedicalRecordFilters({
                 <option value="ALL">All Statuses</option>
                 <option value="Finalized">Finalized</option>
                 <option value="Draft">Drafts Only</option>
+                <option value="Amended">Amended</option>
+                <option value="ReviewRequired">Review Required</option>
               </select>
             </div>
           </div>

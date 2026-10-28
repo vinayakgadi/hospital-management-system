@@ -149,15 +149,24 @@ export default function MedicalRecordsTable({
 
                   {/* Record Status */}
                   <td>
-                    <span
-                      className={`badge rounded-pill px-2.5 py-1.5 font-monospace small ${
-                        isDraft
-                          ? 'bg-warning-subtle text-warning-emphasis border border-warning-subtle'
-                          : 'bg-success-subtle text-success border border-success-subtle'
-                      }`}
-                    >
-                      {isDraft ? 'Draft' : 'Finalized'}
-                    </span>
+                    {rec.review_required ? (
+                      <span className="badge rounded-pill px-2.5 py-1.5 small bg-danger-subtle text-danger border border-danger-subtle font-monospace d-inline-flex align-items-center gap-1">
+                        <AlertCircle size={12} />
+                        <span>Review Required</span>
+                      </span>
+                    ) : isDraft ? (
+                      <span className="badge rounded-pill px-2.5 py-1.5 small bg-warning-subtle text-warning-emphasis border border-warning-subtle font-monospace">
+                        Draft
+                      </span>
+                    ) : rec.is_amended ? (
+                      <span className="badge rounded-pill px-2.5 py-1.5 small bg-info-subtle text-info-emphasis border border-info-subtle font-monospace">
+                        Amended
+                      </span>
+                    ) : (
+                      <span className="badge rounded-pill px-2.5 py-1.5 small bg-success-subtle text-success border border-success-subtle font-monospace">
+                        Finalized
+                      </span>
+                    )}
                   </td>
 
                   {/* Last Updated */}
@@ -180,24 +189,34 @@ export default function MedicalRecordsTable({
                         <Eye size={15} />
                       </button>
 
-                      {/* Edit Draft */}
-                      {isDraft && (
-                        <button
-                          type="button"
-                          className="btn btn-outline-warning btn-sm p-1.5 rounded-2"
-                          title="Edit Draft Record"
-                          onClick={() => onEditRecord(rec)}
-                        >
-                          <Edit3 size={15} />
-                        </button>
-                      )}
+                      {/* Edit / Amend Record (Available for Admin) */}
+                      <button
+                        type="button"
+                        className={`btn btn-sm p-1.5 rounded-2 ${
+                          rec.review_required
+                            ? 'btn-outline-danger'
+                            : isDraft
+                            ? 'btn-outline-warning'
+                            : 'btn-outline-secondary'
+                        }`}
+                        title={
+                          rec.review_required
+                            ? 'Review & Amend Clinical Record'
+                            : isDraft
+                            ? 'Edit Draft Record'
+                            : 'Amend / Re-finalize Record'
+                        }
+                        onClick={() => onEditRecord(rec)}
+                      >
+                        <Edit3 size={15} />
+                      </button>
 
-                      {/* Finalize Draft */}
-                      {isDraft && (
+                      {/* Finalize Draft / Re-finalize Record */}
+                      {(isDraft || rec.review_required) && (
                         <button
                           type="button"
                           className="btn btn-outline-success btn-sm p-1.5 rounded-2"
-                          title="Finalize Draft Record"
+                          title="Finalize & Authenticate Record"
                           onClick={() => onFinalizeRecord(rec.id)}
                         >
                           <CheckCircle size={15} />

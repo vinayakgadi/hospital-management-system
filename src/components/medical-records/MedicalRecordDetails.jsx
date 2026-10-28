@@ -101,15 +101,24 @@ export default function MedicalRecordDetails({
                 <h5 id="emr-modal-title" className="fw-bold text-dark mb-0 text-truncate">
                   Electronic Medical Record #{formattedId}
                 </h5>
-                <span
-                  className={`badge rounded-pill font-monospace small px-2.5 py-1 ${
-                    isDraft
-                      ? 'bg-warning-subtle text-warning-emphasis border border-warning-subtle'
-                      : 'bg-success-subtle text-success border border-success-subtle'
-                  }`}
-                >
-                  {isDraft ? 'Draft Status' : 'Finalized & Verified'}
-                </span>
+                {record.review_required ? (
+                  <span className="badge rounded-pill font-monospace small px-2.5 py-1 bg-danger-subtle text-danger border border-danger-subtle d-inline-flex align-items-center gap-1">
+                    <AlertTriangle size={12} />
+                    <span>Review Required</span>
+                  </span>
+                ) : isDraft ? (
+                  <span className="badge rounded-pill font-monospace small px-2.5 py-1 bg-warning-subtle text-warning-emphasis border border-warning-subtle">
+                    Draft Status
+                  </span>
+                ) : record.is_amended ? (
+                  <span className="badge rounded-pill font-monospace small px-2.5 py-1 bg-info-subtle text-info-emphasis border border-info-subtle">
+                    Finalized & Amended
+                  </span>
+                ) : (
+                  <span className="badge rounded-pill font-monospace small px-2.5 py-1 bg-success-subtle text-success border border-success-subtle">
+                    Finalized & Verified
+                  </span>
+                )}
               </div>
               <small className="text-muted d-block text-truncate" style={{ fontSize: '0.8rem' }}>
                 Consultation: <strong className="text-dark">{record.consultation_date}</strong> •{' '}
@@ -142,6 +151,28 @@ export default function MedicalRecordDetails({
             2. SCROLLABLE MODAL BODY
             ========================================================= */}
         <main className="emr-modal-body">
+          {/* Action Required Banner for Review-Required Records */}
+          {record.review_required && (
+            <div className="alert alert-danger border border-danger rounded-4 p-3.5 mb-4 d-flex align-items-center justify-content-between gap-3">
+              <div className="d-flex align-items-start gap-2.5">
+                <AlertTriangle size={22} className="text-danger flex-shrink-0 mt-0.5" />
+                <div>
+                  <strong className="d-block text-danger mb-0.5">Clinical Review & Re-Finalization Required</strong>
+                  <p className="small text-dark mb-0">
+                    {record.review_reason || 'This record has been flagged for administrative review and clinical deduplication.'}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-danger btn-sm rounded-3 px-3 flex-shrink-0 shadow-sm"
+                onClick={() => onEditDraft(record)}
+              >
+                Review & Amend Record
+              </button>
+            </div>
+          )}
+
           {/* Patient and Doctor Cards */}
           <section className="emr-participants-grid" aria-label="Patient and Doctor Information">
             {/* Patient Profile Card */}
@@ -233,12 +264,21 @@ export default function MedicalRecordDetails({
                 <span className="emr-info-value">{record.consultation_time || '10:00 AM'}</span>
               </div>
 
-              <div className="emr-info-row mb-0">
+              <div className="emr-info-row">
                 <span className="emr-info-label">Encounter Setting:</span>
                 <span className="badge bg-secondary-subtle text-secondary border">
                   {record.visit_type || 'In-Person'}
                 </span>
               </div>
+
+              {record.appointment_id && (
+                <div className="emr-info-row mb-0">
+                  <span className="emr-info-label">Linked Appointment:</span>
+                  <span className="badge bg-primary-subtle text-primary border border-primary-subtle">
+                    Encounter #{record.appointment_id}
+                  </span>
+                </div>
+              )}
             </article>
           </section>
 
@@ -458,6 +498,51 @@ export default function MedicalRecordDetails({
             </section>
           )}
 
+          {/* Clinical Amendment Audit Trail */}
+          {record.amendments && record.amendments.length > 0 && (
+            <section className="card border-0 rounded-4 shadow-xs bg-white mb-4 border" aria-label="Amendment History">
+              <div className="card-body p-3.5">
+                <div className="d-flex align-items-center justify-content-between mb-3">
+                  <div className="d-flex align-items-center gap-2">
+                    <History size={18} className="text-info flex-shrink-0" />
+                    <h6 className="fw-bold mb-0 text-dark">Clinical Amendment History & Audit Trail</h6>
+                  </div>
+                  <span className="badge bg-info-subtle text-info-emphasis border border-info-subtle">
+                    {record.amendments.length} {record.amendments.length === 1 ? 'Amendment Record' : 'Amendment Records'}
+                  </span>
+                </div>
+
+                <div className="d-flex flex-column gap-2.5">
+                  {record.amendments.map((amend) => (
+                    <div key={amend.id} className="p-3 rounded-3 bg-light border small">
+                      <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-1.5">
+                        <span className="fw-bold text-dark">
+                          Amended by {amend.amended_by_name} ({amend.amended_by_role})
+                        </span>
+                        <span className="text-muted font-monospace" style={{ fontSize: '0.74rem' }}>
+                          {amend.created_at}
+                        </span>
+                      </div>
+                      {amend.previous_doctor_id !== amend.new_doctor_id && (
+                        <div className="mb-1 text-primary fw-medium" style={{ fontSize: '0.78rem' }}>
+                          Attending Physician Reassigned: {amend.previous_doctor_name} → {amend.new_doctor_name}
+                        </div>
+                      )}
+                      <p className="mb-1 text-dark" style={{ fontSize: '0.82rem' }}>
+                        <strong>Justification:</strong> {amend.amendment_reason}
+                      </p>
+                      {amend.changes_summary && (
+                        <small className="text-muted d-block" style={{ fontSize: '0.74rem' }}>
+                          Encounter Changes: {amend.changes_summary}
+                        </small>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </section>
+          )}
+
           {/* Timestamps & Audit Trail Strip */}
           <footer className="p-3 rounded-3 bg-white border d-flex flex-wrap justify-content-between align-items-center gap-2 small text-muted">
             <div className="d-flex align-items-center gap-3 flex-wrap">
@@ -490,26 +575,28 @@ export default function MedicalRecordDetails({
           </button>
 
           <div className="d-flex align-items-center gap-2 flex-wrap">
-            {isDraft && (
-              <>
-                <button
-                  type="button"
-                  className="btn btn-outline-warning btn-sm rounded-3 d-flex align-items-center gap-1.5 px-3"
-                  onClick={() => onEditDraft(record)}
-                >
-                  <Edit3 size={15} />
-                  <span>Edit Draft</span>
-                </button>
+            {/* Edit / Amend Action */}
+            <button
+              type="button"
+              className={`btn btn-sm rounded-3 d-flex align-items-center gap-1.5 px-3.5 ${
+                isDraft ? 'btn-outline-warning' : 'btn-outline-primary'
+              }`}
+              onClick={() => onEditDraft(record)}
+            >
+              <Edit3 size={15} />
+              <span>{isDraft ? 'Edit Draft' : 'Amend / Edit Record'}</span>
+            </button>
 
-                <button
-                  type="button"
-                  className="btn btn-success btn-sm rounded-3 d-flex align-items-center gap-1.5 px-3.5"
-                  onClick={() => onFinalizeDraft(record.id)}
-                >
-                  <CheckCircle size={15} />
-                  <span>Finalize Record</span>
-                </button>
-              </>
+            {/* Finalize Action */}
+            {(isDraft || record.review_required) && (
+              <button
+                type="button"
+                className="btn btn-success btn-sm rounded-3 d-flex align-items-center gap-1.5 px-3.5"
+                onClick={() => onFinalizeDraft(record.id)}
+              >
+                <CheckCircle size={15} />
+                <span>Finalize Record</span>
+              </button>
             )}
 
             <button

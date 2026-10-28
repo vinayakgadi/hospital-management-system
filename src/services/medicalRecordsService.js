@@ -32,9 +32,15 @@ export const medicalRecordsService = {
     return res.data
   },
 
-  // Finalize a draft record
-  finalizeRecord: async (id) => {
-    const res = await axios.put(`${API_BASE_URL}/api/medical-records/${id}/finalize`)
+  // Finalize a draft or re-finalize an amended record
+  finalizeRecord: async (id, payload = {}) => {
+    const res = await axios.put(`${API_BASE_URL}/api/medical-records/${id}/finalize`, payload)
+    return res.data
+  },
+
+  // Fetch clinical amendment history audit trail
+  getRecordAmendments: async (id) => {
+    const res = await axios.get(`${API_BASE_URL}/api/medical-records/${id}/amendments`)
     return res.data
   },
 
