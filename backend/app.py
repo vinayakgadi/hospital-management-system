@@ -2,6 +2,8 @@ import os
 import sqlite3
 import secrets
 import re
+import json
+import math
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, make_response
@@ -225,6 +227,52 @@ def init_db():
         cursor.execute("ALTER TABLE doctors ADD COLUMN biography TEXT DEFAULT 'Senior clinical specialist with over 12 years of experience in patient diagnosis, cardiology care, and comprehensive treatment planning.'")
     if "experience_years" not in doc_cols_ext:
         cursor.execute("ALTER TABLE doctors ADD COLUMN experience_years INTEGER DEFAULT 12")
+
+    # Check and add columns to medical_records table safely
+    cursor.execute("PRAGMA table_info(medical_records)")
+    mr_cols = [c[1] for c in cursor.fetchall()]
+    if "consultation_time" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN consultation_time TEXT DEFAULT '10:00 AM'")
+    if "visit_type" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN visit_type TEXT DEFAULT 'In-Person'")
+    if "visit_reason" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN visit_reason TEXT DEFAULT 'Clinical Consultation'")
+    if "vital_signs" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN vital_signs TEXT DEFAULT '{}'")
+    if "follow_up_notes" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN follow_up_notes TEXT DEFAULT ''")
+    if "status" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN status TEXT DEFAULT 'Finalized'")
+    if "updated_at" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN updated_at TIMESTAMP")
+    if "finalized_at" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN finalized_at TIMESTAMP")
+
+    # Safe indexes for medical_records
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_patient ON medical_records(patient_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_doctor ON medical_records(doctor_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_date ON medical_records(consultation_date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_status ON medical_records(status)")
+
+    # 12. Lab Results & Medical Documents Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lab_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            doctor_id INTEGER,
+            test_name TEXT NOT NULL,
+            test_date TEXT NOT NULL,
+            result_value TEXT NOT NULL,
+            units TEXT,
+            reference_range TEXT,
+            status TEXT DEFAULT 'Normal',
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (patient_id) REFERENCES patients(id),
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_lab_patient ON lab_results(patient_id)")
 
     # ---------------------------------------------------------
     # DATA MIGRATION: SEED / LINK CENTRAL USERS
@@ -465,6 +513,30 @@ def init_db():
             VALUES (?, ?, ?, ?, ?)
         """, notifs)
 
+    # K. Seed Lab Results if empty
+    cursor.execute("SELECT COUNT(*) FROM lab_results")
+    if cursor.fetchone()[0] == 0:
+        today = datetime.now()
+        initial_labs = [
+            (1, 1, "Lipid Panel (Total Cholesterol)", (today - timedelta(days=2)).strftime("%Y-%m-%d"), "218", "mg/dL", "< 200 mg/dL", "Abnormal", "Borderline elevated; patient initiated on dietary lifestyle therapy."),
+            (1, 1, "Complete Blood Count (Hemoglobin)", (today - timedelta(days=2)).strftime("%Y-%m-%d"), "14.8", "g/dL", "13.5 - 17.5 g/dL", "Normal", "Erythrocyte and platelet indices within physiologic limits."),
+            (2, 1, "Serum Creatinine", (today - timedelta(days=5)).strftime("%Y-%m-%d"), "1.4", "mg/dL", "0.7 - 1.3 mg/dL", "Abnormal", "Mild elevation consistent with Stage 2 CKD baseline."),
+            (2, 1, "Estimated GFR (eGFR)", (today - timedelta(days=5)).strftime("%Y-%m-%d"), "68", "mL/min/1.73m²", "> 90 mL/min/1.73m²", "Borderline", "Stable renal function on current ACE-inhibitor regimen."),
+            (8, 1, "Glycated Hemoglobin (HbA1c)", (today - timedelta(days=1)).strftime("%Y-%m-%d"), "5.6", "%", "< 5.7%", "Normal", "Euglycemic state; no indication of insulin resistance."),
+            (8, 1, "High-Sensitivity CRP (hs-CRP)", (today - timedelta(days=1)).strftime("%Y-%m-%d"), "1.1", "mg/L", "< 3.0 mg/L", "Normal", "Low cardiovascular inflammatory risk profile.")
+        ]
+        cursor.executemany("""
+            INSERT INTO lab_results (
+                patient_id, doctor_id, test_name, test_date, result_value,
+                units, reference_range, status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, initial_labs)
+
+    # Ensure at least 1 record has 'Draft' status for testing draft workflows
+    cursor.execute("SELECT COUNT(*) FROM medical_records WHERE status = 'Draft'")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("UPDATE medical_records SET status = 'Draft' WHERE id = (SELECT MAX(id) FROM medical_records)")
+
     conn.commit()
     conn.close()
 
@@ -520,20 +592,69 @@ def row_to_doctor_dict(row):
 
 
 def row_to_medical_record_dict(row):
+    row_keys = row.keys() if hasattr(row, "keys") else []
+    
+    # Parse vital signs if JSON string
+    vital_signs_raw = row["vital_signs"] if "vital_signs" in row_keys else "{}"
+    vital_signs = {}
+    if vital_signs_raw:
+        if isinstance(vital_signs_raw, dict):
+            vital_signs = vital_signs_raw
+        elif isinstance(vital_signs_raw, str) and vital_signs_raw.strip().startswith("{"):
+            try:
+                vital_signs = json.loads(vital_signs_raw)
+            except Exception:
+                vital_signs = {}
+        else:
+            vital_signs = {"notes": str(vital_signs_raw)}
+
     return {
         "id": row["id"],
         "patient_id": row["patient_id"],
-        "patient_name": row["patient_name"] if "patient_name" in row.keys() else f"Patient #{row['patient_id']}",
+        "patient_name": row["patient_name"] if "patient_name" in row_keys else f"Patient #{row['patient_id']}",
+        "patient_age": row["patient_age"] if "patient_age" in row_keys else None,
+        "patient_gender": row["patient_gender"] if "patient_gender" in row_keys else None,
+        "patient_email": row["patient_email"] if "patient_email" in row_keys else None,
+        "patient_contact": row["patient_contact"] if ("patient_contact" in row_keys and row["patient_contact"]) else f"+1 (555) 019-{str(row['patient_id']).zfill(4)}",
+        "patient_disease": row["patient_disease"] if "patient_disease" in row_keys else None,
         "doctor_id": row["doctor_id"],
-        "doctor_name": row["doctor_name"] if "doctor_name" in row.keys() else f"Doctor #{row['doctor_id']}",
+        "doctor_name": row["doctor_name"] if "doctor_name" in row_keys else f"Doctor #{row['doctor_id']}",
+        "doctor_specialization": row["doctor_specialization"] if "doctor_specialization" in row_keys else "General Practice",
         "consultation_date": row["consultation_date"],
+        "consultation_time": row["consultation_time"] if ("consultation_time" in row_keys and row["consultation_time"]) else "10:00 AM",
+        "visit_type": row["visit_type"] if ("visit_type" in row_keys and row["visit_type"]) else "In-Person",
+        "visit_reason": row["visit_reason"] if ("visit_reason" in row_keys and row["visit_reason"]) else (row["diagnosis"] or "Clinical Consultation"),
         "symptoms": row["symptoms"] or "",
         "observations": row["observations"] or "",
+        "vital_signs": vital_signs,
         "diagnosis": row["diagnosis"] or "General Assessment",
         "treatment_plan": row["treatment_plan"] or "",
         "clinical_notes": row["clinical_notes"] or "",
         "follow_up_date": row["follow_up_date"] or "",
+        "follow_up_notes": row["follow_up_notes"] if ("follow_up_notes" in row_keys and row["follow_up_notes"]) else "",
+        "status": row["status"] if ("status" in row_keys and row["status"]) else "Finalized",
         "created_at": row["created_at"],
+        "updated_at": row["updated_at"] if ("updated_at" in row_keys and row["updated_at"]) else row["created_at"],
+        "finalized_at": row["finalized_at"] if ("finalized_at" in row_keys and row["finalized_at"]) else (row["created_at"] if (row["status"] if "status" in row_keys else "Finalized") == "Finalized" else None),
+    }
+
+
+def row_to_lab_result_dict(row):
+    row_keys = row.keys() if hasattr(row, "keys") else []
+    return {
+        "id": row["id"],
+        "patient_id": row["patient_id"],
+        "patient_name": row["patient_name"] if "patient_name" in row_keys else f"Patient #{row['patient_id']}",
+        "doctor_id": row["doctor_id"] if "doctor_id" in row_keys else None,
+        "doctor_name": row["doctor_name"] if "doctor_name" in row_keys else "Attending Physician",
+        "test_name": row["test_name"],
+        "test_date": row["test_date"],
+        "result_value": row["result_value"],
+        "units": row["units"] if "units" in row_keys else "",
+        "reference_range": row["reference_range"] if "reference_range" in row_keys else "",
+        "status": row["status"] if "status" in row_keys else "Normal",
+        "notes": row["notes"] if "notes" in row_keys else "",
+        "created_at": row["created_at"] if "created_at" in row_keys else None,
     }
 
 
@@ -1785,6 +1906,585 @@ def create_medical_record(current_user):
     return jsonify({
         "message": "Medical record documented successfully.",
         "record": row_to_medical_record_dict(created_rec)
+    }), 201
+
+
+# ---------------------------------------------------------
+# ELECTRONIC MEDICAL RECORDS (EMR) & LAB RESULTS API
+# ---------------------------------------------------------
+
+@app.route("/api/admin/medical-records/stats", methods=["GET"])
+@require_role("admin", "doctor")
+def get_medical_records_stats(current_user):
+    """Calculates live summary metrics directly from SQLite database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    doctor_filter = ""
+    params = []
+    if current_user["role"] == "doctor":
+        doc_id = current_user.get("doctor_id") or 1
+        doctor_filter = "WHERE doctor_id = ?"
+        params = [doc_id]
+
+    # Total records count
+    cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter}", params)
+    total_records = cursor.fetchone()[0]
+
+    # Records created this month
+    month_clause = "(strftime('%Y-%m', consultation_date) = strftime('%Y-%m', 'now') OR strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now'))"
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND {month_clause}", params)
+    else:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records WHERE {month_clause}")
+    created_this_month = cursor.fetchone()[0]
+
+    # Draft records count
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND status = 'Draft'", params)
+    else:
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE status = 'Draft'")
+    draft_records = cursor.fetchone()[0]
+
+    # Finalized records count
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND (status = 'Finalized' OR status IS NULL OR status = '')", params)
+    else:
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE status = 'Finalized' OR status IS NULL OR status = ''")
+    finalized_records = cursor.fetchone()[0]
+
+    conn.close()
+
+    return jsonify({
+        "total_records": total_records,
+        "created_this_month": created_this_month,
+        "draft_records": draft_records,
+        "finalized_records": finalized_records,
+    })
+
+
+@app.route("/api/medical-records", methods=["GET"])
+@require_role("admin", "doctor")
+def get_medical_records_collection(current_user):
+    """Searchable, filterable, sortable, and paginated medical records."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    search_q = (request.args.get("q") or request.args.get("search") or "").strip().lower()
+    status_filter = request.args.get("status", "ALL").strip()
+    start_date = request.args.get("startDate", "").strip()
+    end_date = request.args.get("endDate", "").strip()
+    patient_id = request.args.get("patient_id", "").strip()
+    doctor_id = request.args.get("doctor_id", "").strip()
+    sort_dir = request.args.get("sort", "desc").strip().lower()
+    if sort_dir not in ["asc", "desc"]:
+        sort_dir = "desc"
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 10)))
+    offset = (page - 1) * per_page
+
+    where_clauses = []
+    params = []
+
+    # Enforce doctor restriction
+    if current_user["role"] == "doctor":
+        doc_id = current_user.get("doctor_id") or 1
+        where_clauses.append("mr.doctor_id = ?")
+        params.append(doc_id)
+    elif doctor_id:
+        where_clauses.append("mr.doctor_id = ?")
+        params.append(int(doctor_id))
+
+    if patient_id:
+        where_clauses.append("mr.patient_id = ?")
+        params.append(int(patient_id))
+
+    if status_filter and status_filter != "ALL":
+        if status_filter == "Finalized":
+            where_clauses.append("(mr.status = 'Finalized' OR mr.status IS NULL OR mr.status = '')")
+        else:
+            where_clauses.append("mr.status = ?")
+            params.append(status_filter)
+
+    if start_date:
+        where_clauses.append("date(mr.consultation_date) >= date(?)")
+        params.append(start_date)
+    if end_date:
+        where_clauses.append("date(mr.consultation_date) <= date(?)")
+        params.append(end_date)
+
+    if search_q:
+        where_clauses.append("""
+            (LOWER(p.name) LIKE ? OR
+             LOWER(d.name) LIKE ? OR
+             LOWER(mr.diagnosis) LIKE ? OR
+             LOWER(mr.visit_reason) LIKE ? OR
+             CAST(mr.id AS TEXT) LIKE ? OR
+             CAST(p.id AS TEXT) LIKE ?)
+        """)
+        search_param = f"%{search_q}%"
+        params.extend([search_param, search_param, search_param, search_param, search_param, search_param])
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    # Count matching records
+    count_sql = f"""
+        SELECT COUNT(*)
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        {where_sql}
+    """
+    cursor.execute(count_sql, params)
+    total_records = cursor.fetchone()[0]
+
+    # Fetch paginated rows
+    fetch_sql = f"""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        {where_sql}
+        ORDER BY mr.consultation_date {sort_dir.upper()}, mr.id {sort_dir.upper()}
+        LIMIT ? OFFSET ?
+    """
+    cursor.execute(fetch_sql, params + [per_page, offset])
+    rows = cursor.fetchall()
+    conn.close()
+
+    records = [row_to_medical_record_dict(r) for r in rows]
+    total_pages = max(1, math.ceil(total_records / per_page))
+
+    return jsonify({
+        "records": records,
+        "total": total_records,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+    })
+
+
+@app.route("/api/medical-records/<int:record_id>", methods=["GET"])
+@require_role("admin", "doctor")
+def get_medical_record_detail(current_user, record_id):
+    """Retrieves full medical record detail with associated patient chart & lab history."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Medical record not found."}), 404
+
+    # Doctor ownership check
+    if current_user["role"] == "doctor":
+        if current_user.get("doctor_id") and row["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You are not authorized to view this record."}), 403
+
+    record = row_to_medical_record_dict(row)
+
+    # Patient's associated lab results
+    cursor.execute("""
+        SELECT lr.*, d.name as doctor_name
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.patient_id = ?
+        ORDER BY lr.test_date DESC, lr.id DESC LIMIT 10
+    """, (row["patient_id"],))
+    lab_rows = cursor.fetchall()
+    lab_results = [row_to_lab_result_dict(lr) for lr in lab_rows]
+
+    # Patient's active prescriptions
+    cursor.execute("""
+        SELECT pr.*, d.name as doctor_name
+        FROM prescriptions pr
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.patient_id = ?
+        ORDER BY pr.prescription_date DESC LIMIT 5
+    """, (row["patient_id"],))
+    rx_rows = cursor.fetchall()
+    prescriptions = [row_to_prescription_dict(pr) for pr in rx_rows]
+
+    conn.close()
+
+    return jsonify({
+        "record": record,
+        "lab_results": lab_results,
+        "prescriptions": prescriptions,
+    })
+
+
+@app.route("/api/medical-records", methods=["POST"])
+@require_role("admin", "doctor")
+def create_medical_record_entry(current_user):
+    """Creates a new medical record with Draft or Finalized status."""
+    data = request.get_json(silent=True) or {}
+    patient_id = data.get("patient_id")
+    doctor_id = data.get("doctor_id")
+    diagnosis = (data.get("diagnosis") or "").strip()
+    symptoms = (data.get("symptoms") or "").strip()
+    observations = (data.get("observations") or "").strip()
+    treatment_plan = (data.get("treatment_plan") or "").strip()
+    clinical_notes = (data.get("clinical_notes") or "").strip()
+    visit_reason = (data.get("visit_reason") or diagnosis or "Clinical Consultation").strip()
+    visit_type = (data.get("visit_type") or "In-Person").strip()
+    consultation_date = (data.get("consultation_date") or datetime.now().strftime("%Y-%m-%d")).strip()
+    consultation_time = (data.get("consultation_time") or datetime.now().strftime("%I:%M %p")).strip()
+    follow_up_date = (data.get("follow_up_date") or "").strip()
+    follow_up_notes = (data.get("follow_up_notes") or "").strip()
+    status = (data.get("status") or "Finalized").strip()
+    if status not in ["Draft", "Finalized"]:
+        status = "Finalized"
+
+    # Vital signs processing
+    vitals = data.get("vital_signs", {})
+    vital_signs_str = json.dumps(vitals) if isinstance(vitals, dict) else str(vitals)
+
+    # Doctor assignment
+    if current_user["role"] == "doctor":
+        doctor_id = current_user.get("doctor_id") or 1
+    elif not doctor_id:
+        doctor_id = 1
+
+    if not patient_id:
+        return jsonify({"error": "Please select a patient."}), 400
+    if not diagnosis:
+        return jsonify({"error": "Clinical diagnosis is required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Validate patient
+    cursor.execute("SELECT id, name, user_id FROM patients WHERE id = ?", (patient_id,))
+    pat = cursor.fetchone()
+    if not pat:
+        conn.close()
+        return jsonify({"error": "Selected patient does not exist."}), 404
+
+    # Validate doctor
+    cursor.execute("SELECT id, name FROM doctors WHERE id = ?", (doctor_id,))
+    doc = cursor.fetchone()
+    if not doc:
+        conn.close()
+        return jsonify({"error": "Selected doctor does not exist."}), 404
+
+    finalized_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if status == "Finalized" else None
+
+    cursor.execute("""
+        INSERT INTO medical_records (
+            patient_id, doctor_id, consultation_date, consultation_time, visit_type,
+            visit_reason, symptoms, observations, vital_signs, diagnosis,
+            treatment_plan, clinical_notes, follow_up_date, follow_up_notes,
+            status, finalized_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        patient_id, doctor_id, consultation_date, consultation_time, visit_type,
+        visit_reason, symptoms, observations, vital_signs_str, diagnosis,
+        treatment_plan, clinical_notes, follow_up_date, follow_up_notes,
+        status, finalized_at
+    ))
+    new_id = cursor.lastrowid
+    conn.commit()
+
+    log_activity(
+        "MEDICAL_RECORD_CREATED",
+        f"Medical Record #{new_id} ({status}) documented for {pat['name']}: {diagnosis}",
+        "MedicalRecord",
+        new_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    # Notify patient
+    if pat["user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type)
+            VALUES (?, 'New Clinical Encounter Documented', ?, 'medical')
+        """, (pat["user_id"], f"Medical record #{new_id} ({status}) has been added: {diagnosis}"))
+        conn.commit()
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (new_id,))
+    created_rec = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": f"Medical record #{new_id} saved successfully as {status}.",
+        "record": row_to_medical_record_dict(created_rec)
+    }), 201
+
+
+@app.route("/api/medical-records/<int:record_id>", methods=["PUT"])
+@require_role("admin", "doctor")
+def update_medical_record_entry(current_user, record_id):
+    """Updates an existing medical record with controlled amendment tracking."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM medical_records WHERE id = ?", (record_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "Medical record not found."}), 404
+
+    # Enforce doctor restriction
+    if current_user["role"] == "doctor":
+        if current_user.get("doctor_id") and existing["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only edit records you authored."}), 403
+
+    data = request.get_json(silent=True) or {}
+    diagnosis = (data.get("diagnosis") or existing["diagnosis"] or "").strip()
+    symptoms = data.get("symptoms", existing["symptoms"] or "")
+    observations = data.get("observations", existing["observations"] or "")
+    treatment_plan = data.get("treatment_plan", existing["treatment_plan"] or "")
+    clinical_notes = data.get("clinical_notes", existing["clinical_notes"] or "")
+    visit_reason = data.get("visit_reason", existing["visit_reason"] or diagnosis)
+    visit_type = data.get("visit_type", existing["visit_type"] or "In-Person")
+    consultation_date = data.get("consultation_date", existing["consultation_date"])
+    consultation_time = data.get("consultation_time", existing["consultation_time"] or "10:00 AM")
+    follow_up_date = data.get("follow_up_date", existing["follow_up_date"] or "")
+    follow_up_notes = data.get("follow_up_notes", existing["follow_up_notes"] or "")
+    doctor_id = data.get("doctor_id", existing["doctor_id"])
+
+    vitals = data.get("vital_signs")
+    if vitals is not None:
+        vital_signs_str = json.dumps(vitals) if isinstance(vitals, dict) else str(vitals)
+    else:
+        vital_signs_str = existing["vital_signs"]
+
+    new_status = data.get("status", existing["status"] or "Finalized")
+    was_draft = existing["status"] == "Draft"
+    is_now_final = new_status == "Finalized"
+
+    finalized_at = existing["finalized_at"]
+    if was_draft and is_now_final:
+        finalized_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        UPDATE medical_records
+        SET doctor_id = ?, consultation_date = ?, consultation_time = ?, visit_type = ?,
+            visit_reason = ?, symptoms = ?, observations = ?, vital_signs = ?,
+            diagnosis = ?, treatment_plan = ?, clinical_notes = ?,
+            follow_up_date = ?, follow_up_notes = ?, status = ?,
+            finalized_at = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (
+        doctor_id, consultation_date, consultation_time, visit_type,
+        visit_reason, symptoms, observations, vital_signs_str,
+        diagnosis, treatment_plan, clinical_notes,
+        follow_up_date, follow_up_notes, new_status,
+        finalized_at, record_id
+    ))
+    conn.commit()
+
+    log_activity(
+        "MEDICAL_RECORD_UPDATED" if not (was_draft and is_now_final) else "MEDICAL_RECORD_FINALIZED",
+        f"Medical Record #{record_id} ({new_status}) updated by {current_user['name']}",
+        "MedicalRecord",
+        record_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    updated_rec = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": f"Medical record #{record_id} successfully updated.",
+        "record": row_to_medical_record_dict(updated_rec)
+    })
+
+
+@app.route("/api/medical-records/<int:record_id>/finalize", methods=["PUT"])
+@require_role("admin", "doctor")
+def finalize_medical_record_action(current_user, record_id):
+    """Finalizes a draft medical record."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM medical_records WHERE id = ?", (record_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "Medical record not found."}), 404
+
+    if current_user["role"] == "doctor":
+        if current_user.get("doctor_id") and existing["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only finalize records you authored."}), 403
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+        UPDATE medical_records
+        SET status = 'Finalized', finalized_at = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (now_str, record_id))
+    conn.commit()
+
+    log_activity(
+        "MEDICAL_RECORD_FINALIZED",
+        f"Medical Record #{record_id} finalized by {current_user['name']}",
+        "MedicalRecord",
+        record_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    updated_rec = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": f"Medical record #{record_id} is now finalized.",
+        "record": row_to_medical_record_dict(updated_rec)
+    })
+
+
+@app.route("/api/patients/<int:patient_id>/medical-records", methods=["GET"])
+@require_role("admin", "doctor", "patient")
+def get_patient_medical_history_records(current_user, patient_id):
+    """Retrieves full clinical consultation history for a given patient."""
+    if current_user["role"] == "patient":
+        if current_user.get("patient_id") and current_user["patient_id"] != patient_id:
+            return jsonify({"error": "Access Denied: You cannot view another patient's medical history."}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+    patient = cursor.fetchone()
+    if not patient:
+        conn.close()
+        return jsonify({"error": "Patient not found."}), 404
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.patient_id = ?
+        ORDER BY mr.consultation_date DESC, mr.id DESC
+    """, (patient_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "patient": row_to_patient_dict(patient),
+        "records": [row_to_medical_record_dict(r) for r in rows],
+        "total": len(rows)
+    })
+
+
+@app.route("/api/patients/<int:patient_id>/lab-results", methods=["GET"])
+@require_role("admin", "doctor", "patient")
+def get_patient_lab_results_list(current_user, patient_id):
+    """Retrieves lab diagnostics results for a patient."""
+    if current_user["role"] == "patient":
+        if current_user.get("patient_id") and current_user["patient_id"] != patient_id:
+            return jsonify({"error": "Access Denied: You cannot view another patient's lab results."}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT lr.*, d.name as doctor_name
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.patient_id = ?
+        ORDER BY lr.test_date DESC, lr.id DESC
+    """, (patient_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_lab_result_dict(r) for r in rows])
+
+
+@app.route("/api/lab-results", methods=["POST"])
+@require_role("admin", "doctor")
+def add_new_lab_result(current_user):
+    """Adds a new diagnostic laboratory result."""
+    data = request.get_json(silent=True) or {}
+    patient_id = data.get("patient_id")
+    test_name = (data.get("test_name") or "").strip()
+    test_date = (data.get("test_date") or datetime.now().strftime("%Y-%m-%d")).strip()
+    result_value = (data.get("result_value") or "").strip()
+    units = (data.get("units") or "").strip()
+    reference_range = (data.get("reference_range") or "").strip()
+    status = (data.get("status") or "Normal").strip()
+    notes = (data.get("notes") or "").strip()
+    doctor_id = data.get("doctor_id") or (current_user.get("doctor_id") if current_user["role"] == "doctor" else 1)
+
+    if not patient_id or not test_name or not result_value:
+        return jsonify({"error": "Patient ID, Test Name, and Result Value are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO lab_results (
+            patient_id, doctor_id, test_name, test_date, result_value,
+            units, reference_range, status, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (patient_id, doctor_id, test_name, test_date, result_value, units, reference_range, status, notes))
+    new_id = cursor.lastrowid
+    conn.commit()
+
+    cursor.execute("""
+        SELECT lr.*, d.name as doctor_name
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.id = ?
+    """, (new_id,))
+    created = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": "Lab result recorded successfully.",
+        "lab_result": row_to_lab_result_dict(created)
     }), 201
 
 

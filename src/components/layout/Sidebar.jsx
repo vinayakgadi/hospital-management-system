@@ -24,7 +24,7 @@ export default function Sidebar({ isOpen, onClose }) {
     { label: 'Patients', to: '/admin/patients', icon: Users },
     { label: 'Doctors', to: '/admin/doctors', icon: UserPlus },
     { label: 'Appointments', to: '/admin/appointments', icon: Calendar },
-    { label: 'Medical Records', to: '/admin/medical-records', icon: FileText, badge: 'Roadmap' },
+    { label: 'Medical Records', to: '/admin/medical-records', icon: FileText },
     { label: 'Prescriptions', to: '/admin/prescriptions', icon: Pill, badge: 'Roadmap' },
     { label: 'Reports', to: '/admin/reports', icon: BarChart3, badge: 'Roadmap' },
     { label: 'Settings', to: '/admin/settings', icon: Settings, badge: 'Roadmap' },

@@ -12,6 +12,7 @@ import AdminOverview from './pages/admin/AdminOverview.jsx'
 import AdminPatients from './pages/admin/AdminPatients.jsx'
 import AdminDoctors from './pages/admin/AdminDoctors.jsx'
 import AdminAppointments from './pages/admin/AdminAppointments.jsx'
+import MedicalRecords from './pages/admin/MedicalRecords.jsx'
 import AdminPlaceholder from './pages/admin/AdminPlaceholder.jsx'
 import DoctorLayout from './components/doctor/DoctorLayout.jsx'
 import DoctorDashboard from './pages/doctor/DoctorDashboard.jsx'
@@ -114,7 +115,7 @@ export default function App() {
             <Route path="patients" element={<AdminPatients />} />
             <Route path="doctors" element={<AdminDoctors />} />
             <Route path="appointments" element={<AdminAppointments />} />
-            <Route path="medical-records" element={<AdminPlaceholder />} />
+            <Route path="medical-records" element={<MedicalRecords />} />
             <Route path="prescriptions" element={<AdminPlaceholder />} />
             <Route path="reports" element={<AdminPlaceholder />} />
             <Route path="settings" element={<AdminPlaceholder />} />
