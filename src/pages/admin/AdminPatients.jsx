@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
 import { API_BASE_URL } from '../../config.js'
 import PatientCard from '../../PatientCard.jsx'
@@ -20,16 +20,26 @@ import {
   Eye,
   Pencil,
   Trash2,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react'
 
 export default function AdminPatients() {
   const [patients, setPatients] = useState([])
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [selectedDisease, setSelectedDisease] = useState('ALL')
+  const [diseaseOptions, setDiseaseOptions] = useState([])
   const [sortBy, setSortBy] = useState('name-asc')
   const [viewMode, setViewMode] = useState('grid') // 'grid' | 'table'
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+
+  // Server-side pagination state
+  const [page, setPage] = useState(1)
+  const [perPage] = useState(12)
+  const [totalPages, setTotalPages] = useState(1)
+  const [totalCount, setTotalCount] = useState(0)
 
   // Modals state
   const [isModalOpen, setIsModalOpen] = useState(false)
@@ -39,6 +49,15 @@ export default function AdminPatients() {
   const [isDeleting, setIsDeleting] = useState(false)
   const [toastNotification, setToastNotification] = useState(null)
 
+  // Debounce search input by 300ms
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search)
+      setPage(1)
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [search])
+
   const showToast = (message, type = 'success') => {
     setToastNotification({ message, type })
     setTimeout(() => {
@@ -46,30 +65,64 @@ export default function AdminPatients() {
     }, 4500)
   }
 
-  const fetchPatients = () => {
+  // Fetch paginated patients from server with request cancellation
+  useEffect(() => {
+    const controller = new AbortController()
     setLoading(true)
     setError(null)
+
+    const params = {
+      page,
+      per_page: perPage,
+      search: debouncedSearch,
+      disease: selectedDisease !== 'ALL' ? selectedDisease : undefined,
+      sort: sortBy,
+    }
+
     axios
-      .get(`${API_BASE_URL}/patients`)
+      .get(`${API_BASE_URL}/patients`, {
+        params,
+        signal: controller.signal,
+      })
       .then((res) => {
-        setPatients(Array.isArray(res.data) ? res.data : [])
+        if (res.data && typeof res.data === 'object' && !Array.isArray(res.data)) {
+          setPatients(res.data.patients || [])
+          setTotalCount(res.data.total || 0)
+          setTotalPages(res.data.total_pages || 1)
+          if (res.data.diseases && res.data.diseases.length > 0) {
+            setDiseaseOptions(res.data.diseases)
+          }
+        } else if (Array.isArray(res.data)) {
+          setPatients(res.data)
+          setTotalCount(res.data.length)
+          setTotalPages(1)
+        }
         setLoading(false)
       })
       .catch((err) => {
+        if (axios.isCancel(err) || err.name === 'CanceledError') {
+          return // Ignore canceled request
+        }
         console.error('Error fetching patients:', err)
         setError('Unable to load patient records from server. Please try again.')
         setLoading(false)
       })
-  }
 
-  useEffect(() => {
-    fetchPatients()
-  }, [])
+    return () => {
+      controller.abort()
+    }
+  }, [page, perPage, debouncedSearch, selectedDisease, sortBy])
+
+  const refreshList = () => {
+    setPage(1)
+    setSearch('')
+    setSelectedDisease('ALL')
+  }
 
   // Create Patient Handler
   const handlePatientAdded = (newPatient) => {
-    setPatients((prev) => [newPatient, ...prev])
     showToast(`Patient record for "${newPatient.name}" created successfully!`)
+    setPage(1)
   }
 
   // Update Patient Handler
@@ -88,55 +141,24 @@ export default function AdminPatients() {
         await axios.delete(`${API_BASE_URL}/patients/${patient.id}`)
       }
       setPatients((prev) => prev.filter((p) => p.id !== patient.id))
+      setTotalCount((c) => Math.max(0, c - 1))
       showToast(`Patient record for "${patient.name}" has been deleted.`, 'danger')
       setPatientToDelete(null)
     } catch (err) {
       console.error('Failed to delete on server:', err)
       setPatients((prev) => prev.filter((p) => p.id !== patient.id))
-      showToast(`Patient record for "${patient.name}" has been deleted.`, 'danger')
+      showToast(`Patient record for "${patient.name}" has been removed.`, 'danger')
       setPatientToDelete(null)
     } finally {
       setIsDeleting(false)
     }
   }
 
-  // Extract unique disease list
-  const diseaseOptions = useMemo(() => {
-    const list = new Set()
-    patients.forEach((p) => {
-      if (p.disease) list.add(p.disease.trim())
-    })
-    return Array.from(list).sort()
-  }, [patients])
-
-  // Filter and Sort logic
-  const filteredPatients = useMemo(() => {
-    let result = patients.filter((patient) => {
-      const matchesSearch =
-        (patient.name || '').toLowerCase().includes(search.toLowerCase()) ||
-        (patient.doctor?.name || '').toLowerCase().includes(search.toLowerCase()) ||
-        (patient.email || '').toLowerCase().includes(search.toLowerCase())
-
-      const matchesDisease =
-        selectedDisease === 'ALL' ||
-        (patient.disease || '').toLowerCase() === selectedDisease.toLowerCase()
-
-      return matchesSearch && matchesDisease
-    })
-
-    return result.sort((a, b) => {
-      if (sortBy === 'name-asc') return (a.name || '').localeCompare(b.name || '')
-      if (sortBy === 'name-desc') return (b.name || '').localeCompare(a.name || '')
-      if (sortBy === 'age-asc') return Number(a.age || 0) - Number(b.age || 0)
-      if (sortBy === 'age-desc') return Number(b.age || 0) - Number(a.age || 0)
-      return 0
-    })
-  }, [patients, search, selectedDisease, sortBy])
-
   const handleResetFilters = () => {
     setSearch('')
     setSelectedDisease('ALL')
     setSortBy('name-asc')
+    setPage(1)
   }
 
   return (
@@ -169,51 +191,53 @@ export default function AdminPatients() {
         </div>
       )}
 
-      {/* Header */}
+      {/* Header Section */}
       <div className="d-flex flex-column flex-sm-row align-items-sm-center justify-content-between gap-3 mb-4">
         <div>
-          <h2 className="h4 fw-bold text-dark mb-1">Patient Management Directory</h2>
+          <h2 className="h4 fw-bold text-dark mb-1">Patient Directory</h2>
           <p className="text-muted small mb-0">
-            Comprehensive patient registry, condition tracking, and clinical details
+            {totalCount} registered patient{totalCount === 1 ? '' : 's'} across institutional records
           </p>
         </div>
 
         <div className="d-flex align-items-center gap-2">
           {/* View Mode Toggle */}
-          <div className="btn-group btn-group-sm p-1 bg-white border rounded-pill shadow-xs" role="group">
+          <div className="btn-group p-1 bg-white border rounded-pill shadow-xs" role="group">
             <button
               type="button"
-              className={`btn rounded-pill px-3 py-1 ${viewMode === 'grid' ? 'btn-primary' : 'btn-light border-0 text-secondary'}`}
+              className={`btn btn-sm rounded-pill px-3 d-inline-flex align-items-center gap-1 ${
+                viewMode === 'grid' ? 'btn-primary' : 'btn-light border-0 text-secondary'
+              }`}
               onClick={() => setViewMode('grid')}
-              title="Grid View"
             >
-              <LayoutGrid size={14} className="me-1" />
-              Grid
+              <LayoutGrid size={15} />
+              <span className="d-none d-md-inline">Grid</span>
             </button>
             <button
               type="button"
-              className={`btn rounded-pill px-3 py-1 ${viewMode === 'table' ? 'btn-primary' : 'btn-light border-0 text-secondary'}`}
+              className={`btn btn-sm rounded-pill px-3 d-inline-flex align-items-center gap-1 ${
+                viewMode === 'table' ? 'btn-primary' : 'btn-light border-0 text-secondary'
+              }`}
               onClick={() => setViewMode('table')}
-              title="Table View"
             >
-              <List size={14} className="me-1" />
-              Table
+              <List size={15} />
+              <span className="d-none d-md-inline">Table</span>
             </button>
           </div>
 
           <button
             type="button"
             className="btn btn-outline-secondary rounded-pill px-3 btn-sm d-inline-flex align-items-center gap-1"
-            onClick={fetchPatients}
+            onClick={refreshList}
             title="Refresh patient list"
           >
             <RefreshCw size={14} />
-            <span>Refresh</span>
+            <span className="d-none d-sm-inline">Refresh</span>
           </button>
 
           <button
             type="button"
-            className="btn btn-primary rounded-pill px-3 btn-sm d-inline-flex align-items-center gap-1 shadow-xs fw-semibold"
+            className="btn btn-primary rounded-pill px-4 btn-sm d-inline-flex align-items-center gap-1 shadow-xs fw-semibold"
             onClick={() => setIsModalOpen(true)}
           >
             <Plus size={16} />
@@ -222,10 +246,10 @@ export default function AdminPatients() {
         </div>
       </div>
 
-      {/* Filter and Search Bar */}
+      {/* Search and Filters Toolbar */}
       <div className="card border-0 shadow-sm rounded-4 bg-white p-3 mb-4" style={{ border: '1px solid #e2e8f0' }}>
         <div className="row g-3 align-items-center">
-          {/* Search */}
+          {/* Search Input */}
           <div className="col-12 col-md-5">
             <div className="input-group">
               <span className="input-group-text bg-white border-end-0 text-muted">
@@ -234,34 +258,28 @@ export default function AdminPatients() {
               <input
                 type="text"
                 className="form-control border-start-0 ps-0"
-                placeholder="Search by patient, doctor, or email..."
+                placeholder="Search patient, physician, or condition..."
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
-              {search && (
-                <button
-                  className="btn btn-link text-muted text-decoration-none"
-                  type="button"
-                  onClick={() => setSearch('')}
-                >
-                  &times;
-                </button>
-              )}
             </div>
           </div>
 
-          {/* Condition Filter */}
-          <div className="col-12 col-sm-6 col-md-4">
+          {/* Disease/Condition Filter */}
+          <div className="col-12 col-sm-6 col-md-3">
             <div className="input-group">
               <span className="input-group-text bg-white border-end-0 text-muted">
                 <Filter size={16} />
               </span>
               <select
-                className="form-select border-start-0"
+                className="form-select border-start-0 ps-0"
                 value={selectedDisease}
-                onChange={(e) => setSelectedDisease(e.target.value)}
+                onChange={(e) => {
+                  setSelectedDisease(e.target.value)
+                  setPage(1)
+                }}
               >
-                <option value="ALL">All Medical Conditions</option>
+                <option value="ALL">All Conditions</option>
                 {diseaseOptions.map((disease) => (
                   <option key={disease} value={disease}>
                     {disease}
@@ -271,82 +289,69 @@ export default function AdminPatients() {
             </div>
           </div>
 
-          {/* Sort */}
-          <div className="col-12 col-sm-6 col-md-3">
+          {/* Sort By Dropdown */}
+          <div className="col-12 col-sm-6 col-md-4">
             <div className="input-group">
               <span className="input-group-text bg-white border-end-0 text-muted">
                 <ArrowUpDown size={16} />
               </span>
               <select
-                className="form-select border-start-0"
+                className="form-select border-start-0 ps-0"
                 value={sortBy}
-                onChange={(e) => setSortBy(e.target.value)}
+                onChange={(e) => {
+                  setSortBy(e.target.value)
+                  setPage(1)
+                }}
               >
-                <option value="name-asc">Name (A → Z)</option>
-                <option value="name-desc">Name (Z → A)</option>
-                <option value="age-asc">Age (Youngest First)</option>
-                <option value="age-desc">Age (Oldest First)</option>
+                <option value="name-asc">Sort: Name (A to Z)</option>
+                <option value="name-desc">Sort: Name (Z to A)</option>
+                <option value="age-asc">Sort: Age (Youngest)</option>
+                <option value="age-desc">Sort: Age (Oldest)</option>
+                <option value="id-desc">Sort: Newest First</option>
+                <option value="id-asc">Sort: Oldest First</option>
               </select>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Results Metadata */}
-      {!loading && !error && (
-        <div className="d-flex justify-content-between align-items-center mb-3 px-1 text-muted small">
-          <div>
-            Showing <strong className="text-dark">{filteredPatients.length}</strong> of{' '}
-            <strong className="text-dark">{patients.length}</strong> registered patients
-            {(search || selectedDisease !== 'ALL') && (
-              <button
-                onClick={handleResetFilters}
-                className="btn btn-sm btn-link text-primary text-decoration-none ms-2 p-0"
-              >
-                Clear filters
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Loading */}
+      {/* Loading Indicator */}
       {loading && (
         <div className="text-center py-5 my-5">
           <div className="spinner-border text-primary mb-3" style={{ width: '3rem', height: '3rem' }} role="status">
             <span className="visually-hidden">Loading...</span>
           </div>
-          <h6 className="text-muted fw-normal">Retrieving medical directory...</h6>
+          <h6 className="text-muted fw-normal">Querying database...</h6>
         </div>
       )}
 
-      {/* Error */}
-      {error && !loading && (
-        <div className="alert alert-danger p-4 rounded-4 shadow-sm my-4">
-          <div className="d-flex align-items-center gap-3">
-            <AlertCircle size={28} className="text-danger flex-shrink-0" />
-            <div className="flex-grow-1">
-              <h6 className="fw-bold mb-1">Failed to Load Records</h6>
-              <p className="mb-0 small text-danger-emphasis">{error}</p>
-            </div>
-            <button className="btn btn-danger btn-sm px-3 rounded-pill" onClick={fetchPatients}>
-              Try Again
-            </button>
-          </div>
+      {/* Error Alert */}
+      {!loading && error && (
+        <div className="alert alert-danger rounded-4 p-4 shadow-sm text-center" role="alert">
+          <AlertCircle size={32} className="text-danger mb-2" />
+          <h5 className="alert-heading fw-semibold">Error Loading Patient Records</h5>
+          <p className="text-muted mb-3">{error}</p>
+          <button className="btn btn-outline-danger rounded-pill px-4 btn-sm" onClick={refreshList}>
+            Try Again
+          </button>
         </div>
       )}
 
       {/* Grid View */}
       {!loading && !error && viewMode === 'grid' && (
-        <div className="row row-cols-1 row-cols-sm-2 row-cols-lg-3 row-cols-xl-4 g-4 mb-4">
-          {filteredPatients.length === 0 ? (
+        <div className="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-4 mb-4">
+          {patients.length === 0 ? (
             <div className="col-12 w-100">
-              <div className="card text-center py-5 px-3 border-0 shadow-sm rounded-4 bg-white">
-                <Users size={40} className="text-muted mx-auto mb-3" />
-                <h5 className="fw-bold text-dark">No Patients Found</h5>
-                <p className="text-muted small mb-3">No records match your active search or condition filters.</p>
-                <div className="d-flex justify-content-center gap-2">
-                  <button className="btn btn-outline-secondary rounded-pill px-4 btn-sm" onClick={handleResetFilters}>
+              <div className="card border-0 shadow-sm rounded-4 text-center py-5 px-4 bg-white">
+                <div className="mx-auto mb-3 p-3 rounded-circle bg-light d-inline-block text-muted">
+                  <Users size={40} />
+                </div>
+                <h5 className="fw-semibold text-dark">No Patients Found</h5>
+                <p className="text-muted small mx-auto" style={{ maxWidth: '400px' }}>
+                  No patient profiles match your active filters or search terms. Try adjusting your search query.
+                </p>
+                <div className="d-flex justify-content-center gap-2 mt-2">
+                  <button className="btn btn-light rounded-pill px-3 btn-sm border" onClick={handleResetFilters}>
                     Reset Filters
                   </button>
                   <button className="btn btn-primary rounded-pill px-4 btn-sm" onClick={() => setIsModalOpen(true)}>
@@ -356,7 +361,7 @@ export default function AdminPatients() {
               </div>
             </div>
           ) : (
-            filteredPatients.map((patient, index) => (
+            patients.map((patient, index) => (
               <div className="col" key={patient.id || patient._id || index}>
                 <PatientCard
                   patient={patient}
@@ -386,14 +391,14 @@ export default function AdminPatients() {
                 </tr>
               </thead>
               <tbody>
-                {filteredPatients.length === 0 ? (
+                {patients.length === 0 ? (
                   <tr>
                     <td colSpan="7" className="text-center py-5 text-muted">
                       No records match your active search or condition filters.
                     </td>
                   </tr>
                 ) : (
-                  filteredPatients.map((patient) => {
+                  patients.map((patient) => {
                     const isFemale = (patient.gender || '').toLowerCase() === 'female'
                     return (
                       <tr key={patient.id}>
@@ -434,7 +439,7 @@ export default function AdminPatients() {
                         </td>
                         <td>
                           <span className="fw-medium text-dark d-block" style={{ fontSize: '0.85rem' }}>
-                            Dr. {patient.doctor?.name || patient.doctor_name || 'Unassigned'}
+                            {patient.doctor?.name || patient.doctor_name || 'Unassigned'}
                           </span>
                           <small className="text-muted">
                             {patient.doctor?.specialization || patient.doctor_specialization || 'General Care'}
@@ -479,6 +484,37 @@ export default function AdminPatients() {
                 )}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* Server-Side Pagination Bar */}
+      {!loading && !error && totalPages > 1 && (
+        <div className="d-flex flex-column flex-sm-row align-items-center justify-content-between gap-3 mt-4 px-2">
+          <small className="text-muted">
+            Showing Page <span className="fw-bold text-dark">{page}</span> of{' '}
+            <span className="fw-bold text-dark">{totalPages}</span> ({totalCount} total patient profiles)
+          </small>
+
+          <div className="btn-group shadow-xs">
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1 px-3"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              <ChevronLeft size={16} />
+              <span>Previous</span>
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1 px-3"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            >
+              <span>Next</span>
+              <ChevronRight size={16} />
+            </button>
           </div>
         </div>
       )}

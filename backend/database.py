@@ -1,7 +1,9 @@
 import os
 import re
 import json
+import time
 import sqlite3
+import threading
 from datetime import datetime
 
 # Load environment variables from .env file
@@ -24,9 +26,21 @@ SQLITE_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patie
 try:
     import psycopg2
     import psycopg2.extras
+    import psycopg2.pool
     PSYCOPG2_AVAILABLE = True
 except ImportError:
     PSYCOPG2_AVAILABLE = False
+
+
+def _record_query_time(elapsed_sec):
+    """Safely increments query execution time and query count in current Flask request context."""
+    try:
+        from flask import g, has_request_context
+        if has_request_context():
+            g.db_query_time = getattr(g, "db_query_time", 0.0) + elapsed_sec
+            g.db_query_count = getattr(g, "db_query_count", 0) + 1
+    except Exception:
+        pass
 
 
 def is_postgres_configured():
@@ -144,12 +158,15 @@ class PostgresCursorWrapper:
 
     def execute(self, query, params=None):
         translated_query, was_insert_returning = self._translate_query(query)
-        if params is None:
-            self.cursor.execute(translated_query)
-        else:
-            # Convert list params to tuple for psycopg2
-            tuple_params = tuple(params) if isinstance(params, (list, tuple)) else (params,)
-            self.cursor.execute(translated_query, tuple_params)
+        t0 = time.time()
+        try:
+            if params is None:
+                self.cursor.execute(translated_query)
+            else:
+                tuple_params = tuple(params) if isinstance(params, (list, tuple)) else (params,)
+                self.cursor.execute(translated_query, tuple_params)
+        finally:
+            _record_query_time(time.time() - t0)
 
         if was_insert_returning:
             try:
@@ -165,7 +182,11 @@ class PostgresCursorWrapper:
 
     def executemany(self, query, seq_of_parameters):
         translated_query, _ = self._translate_query(query)
-        return self.cursor.executemany(translated_query, seq_of_parameters)
+        t0 = time.time()
+        try:
+            return self.cursor.executemany(translated_query, seq_of_parameters)
+        finally:
+            _record_query_time(time.time() - t0)
 
     def _wrap_row(self, row):
         if row is None or not self.cursor.description:
@@ -203,10 +224,30 @@ class PostgresCursorWrapper:
         self.cursor.close()
 
 
+_POOL_LOCK = threading.Lock()
+_POSTGRES_POOL = None
+
+
+def get_postgres_pool(minconn=2, maxconn=20):
+    """Initializes and returns the singleton ThreadedConnectionPool."""
+    global _POSTGRES_POOL
+    if _POSTGRES_POOL is None:
+        with _POOL_LOCK:
+            if _POSTGRES_POOL is None and is_postgres_configured() and PSYCOPG2_AVAILABLE:
+                _POSTGRES_POOL = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=minconn,
+                    maxconn=maxconn,
+                    dsn=DATABASE_URL
+                )
+    return _POSTGRES_POOL
+
+
 class PostgresConnectionWrapper:
-    """Wraps psycopg2 connection to provide uniform get_db_connection interface."""
-    def __init__(self, raw_conn):
+    """Wraps psycopg2 connection and returns connection to pool on close()."""
+    def __init__(self, raw_conn, pool=None):
         self.raw_conn = raw_conn
+        self.pool = pool
+        self._closed = False
 
     def cursor(self):
         return PostgresCursorWrapper(self.raw_conn.cursor(), self.raw_conn)
@@ -215,17 +256,38 @@ class PostgresConnectionWrapper:
         self.raw_conn.commit()
 
     def rollback(self):
-        self.raw_conn.rollback()
+        try:
+            self.raw_conn.rollback()
+        except Exception:
+            pass
 
     def close(self):
-        self.raw_conn.close()
+        if self._closed:
+            return
+        self._closed = True
+        if self.pool is not None:
+            try:
+                # Rollback uncommitted transactions before returning to pool
+                self.raw_conn.rollback()
+                self.pool.putconn(self.raw_conn)
+            except Exception:
+                try:
+                    self.pool.putconn(self.raw_conn, close=True)
+                except Exception:
+                    pass
+        else:
+            try:
+                self.raw_conn.close()
+            except Exception:
+                pass
 
 
 def get_db_connection():
     """
     Returns an active database connection:
-    - If DATABASE_URL is set for PostgreSQL, connects to PostgreSQL using psycopg2.
-    - Otherwise, connects to SQLite patients.db.
+    - If PostgreSQL is configured, borrows an existing warm connection from ThreadedConnectionPool.
+    - Automatic connection health recovery if an idle connection dropped.
+    - Otherwise connects to SQLite patients.db.
     """
     if is_postgres_configured():
         if not PSYCOPG2_AVAILABLE:
@@ -233,9 +295,21 @@ def get_db_connection():
                 "PostgreSQL is configured in DATABASE_URL, but 'psycopg2' is not installed. "
                 "Run: pip install psycopg2-binary"
             )
+        pool = get_postgres_pool()
+        if pool is not None:
+            for attempt in range(2):
+                try:
+                    raw_conn = pool.getconn()
+                    if raw_conn.closed != 0:
+                        pool.putconn(raw_conn, close=True)
+                        continue
+                    return PostgresConnectionWrapper(raw_conn, pool=pool)
+                except Exception:
+                    if attempt == 1:
+                        break
         try:
             raw_conn = psycopg2.connect(DATABASE_URL)
-            return PostgresConnectionWrapper(raw_conn)
+            return PostgresConnectionWrapper(raw_conn, pool=None)
         except Exception as e:
             raise ConnectionError(
                 f"Failed to connect to PostgreSQL database at {DATABASE_URL}.\n"

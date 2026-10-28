@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect } from 'react'
 import axios from 'axios'
 import { API_BASE_URL } from '../../config.js'
 import RegisterDoctorModal from '../../components/modals/RegisterDoctorModal.jsx'
@@ -16,6 +16,8 @@ import {
   ShieldCheck,
   UserX,
   UserCheck,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react'
 
 export default function AdminDoctors() {
@@ -23,38 +25,82 @@ export default function AdminDoctors() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [selectedSpecialization, setSelectedSpecialization] = useState('ALL')
+  const [specializationOptions, setSpecializationOptions] = useState([])
   const [isRegisterOpen, setIsRegisterOpen] = useState(false)
   const [togglingId, setTogglingId] = useState(null)
   const [toast, setToast] = useState(null)
+
+  // Server-side pagination
+  const [page, setPage] = useState(1)
+  const [perPage] = useState(12)
+  const [totalPages, setTotalPages] = useState(1)
+  const [totalCount, setTotalCount] = useState(0)
+
+  // Debounce search input
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search)
+      setPage(1)
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [search])
 
   const showToast = (message, type = 'success') => {
     setToast({ message, type })
     setTimeout(() => setToast(null), 4000)
   }
 
-  const fetchDoctors = () => {
+  // Fetch paginated doctors from server with cancellation
+  useEffect(() => {
+    const controller = new AbortController()
     setLoading(true)
     setError(null)
+
+    const params = {
+      page,
+      per_page: perPage,
+      search: debouncedSearch,
+      specialization: selectedSpecialization !== 'ALL' ? selectedSpecialization : undefined,
+    }
+
     axios
-      .get(`${API_BASE_URL}/api/doctors`)
+      .get(`${API_BASE_URL}/api/doctors`, {
+        params,
+        signal: controller.signal,
+      })
       .then((res) => {
-        setDoctors(Array.isArray(res.data) ? res.data : [])
+        if (res.data && typeof res.data === 'object' && !Array.isArray(res.data)) {
+          setDoctors(res.data.doctors || [])
+          setTotalCount(res.data.total || 0)
+          setTotalPages(res.data.total_pages || 1)
+          if (res.data.specializations && res.data.specializations.length > 0) {
+            setSpecializationOptions(res.data.specializations)
+          }
+        } else if (Array.isArray(res.data)) {
+          setDoctors(res.data)
+          setTotalCount(res.data.length)
+          setTotalPages(1)
+        }
         setLoading(false)
       })
       .catch((err) => {
+        if (axios.isCancel(err) || err.name === 'CanceledError') {
+          return
+        }
         console.error('Failed to load doctors:', err)
         setError('Unable to retrieve doctors directory.')
         setLoading(false)
       })
-  }
 
-  useEffect(() => {
-    fetchDoctors()
-  }, [])
+    return () => {
+      controller.abort()
+    }
+  }, [page, perPage, debouncedSearch, selectedSpecialization])
 
   const handleDoctorRegistered = (newDoc) => {
-    setDoctors((prev) => [newDoc, ...prev])
+    setPage(1)
     showToast(`Physician "${newDoc.name}" registered successfully!`)
   }
 
@@ -83,40 +129,18 @@ export default function AdminDoctors() {
       await axios.put(`${API_BASE_URL}/api/admin/users/${doc.user_id}/status`, {
         is_active: newActiveState,
       })
-      showToast(`Account for Dr. ${doc.name} ${newActiveState ? 'activated' : 'deactivated'}.`)
-      fetchDoctors()
+
+      setDoctors((prev) =>
+        prev.map((d) => (d.id === doc.id ? { ...d, status: newActiveState ? 'Active' : 'Inactive' } : d))
+      )
+      showToast(`Physician ${doc.name} account ${actionLabel}d.`)
     } catch (err) {
-      console.error('Failed to update doctor status:', err)
-      showToast(err.response?.data?.error || 'Failed to update account status.', 'danger')
+      console.error('Failed to toggle status:', err)
+      showToast(`Failed to ${actionLabel} physician.`, 'danger')
     } finally {
       setTogglingId(null)
     }
   }
-
-  // Unique specializations
-  const specializations = useMemo(() => {
-    const set = new Set()
-    doctors.forEach((d) => {
-      if (d.specialization) set.add(d.specialization.trim())
-    })
-    return Array.from(set).sort()
-  }, [doctors])
-
-  // Filtered
-  const filteredDoctors = useMemo(() => {
-    return doctors.filter((doc) => {
-      const matchSearch =
-        (doc.name || '').toLowerCase().includes(search.toLowerCase()) ||
-        (doc.email || '').toLowerCase().includes(search.toLowerCase()) ||
-        (doc.specialization || '').toLowerCase().includes(search.toLowerCase())
-
-      const matchSpec =
-        selectedSpecialization === 'ALL' ||
-        (doc.specialization || '').toLowerCase() === selectedSpecialization.toLowerCase()
-
-      return matchSearch && matchSpec
-    })
-  }, [doctors, search, selectedSpecialization])
 
   return (
     <div>
@@ -124,9 +148,7 @@ export default function AdminDoctors() {
       {toast && (
         <div className="position-fixed top-0 end-0 p-3" style={{ zIndex: 1099 }}>
           <div
-            className={`alert alert-${
-              toast.type === 'danger' ? 'danger' : 'success'
-            } shadow-lg border-0 d-flex align-items-center gap-2 rounded-4 px-4 py-3`}
+            className={`alert alert-${toast.type === 'danger' ? 'danger' : 'success'} shadow-lg border-0 d-flex align-items-center gap-2 rounded-4 px-4 py-3`}
             role="alert"
           >
             {toast.type === 'danger' ? (
@@ -136,16 +158,11 @@ export default function AdminDoctors() {
             )}
             <div>
               <strong className="d-block small">
-                {toast.type === 'danger' ? 'Action Failed' : 'Success'}
+                {toast.type === 'danger' ? 'Notice' : 'Success'}
               </strong>
               <small>{toast.message}</small>
             </div>
-            <button
-              type="button"
-              className="btn-close ms-auto"
-              aria-label="Close"
-              onClick={() => setToast(null)}
-            />
+            <button type="button" className="btn-close ms-auto" aria-label="Close" onClick={() => setToast(null)} />
           </div>
         </div>
       )}
@@ -153,9 +170,9 @@ export default function AdminDoctors() {
       {/* Header */}
       <div className="d-flex flex-column flex-sm-row align-items-sm-center justify-content-between gap-3 mb-4">
         <div>
-          <h2 className="h4 fw-bold text-dark mb-1">Doctors & Medical Specialists</h2>
+          <h2 className="h4 fw-bold text-dark mb-1">Clinical Faculty & Physicians</h2>
           <p className="text-muted small mb-0">
-            Credentialed clinical staff directory, departments, and active statuses
+            {totalCount} credentialed physician{totalCount === 1 ? '' : 's'} across institutional specialties
           </p>
         </div>
 
@@ -163,8 +180,8 @@ export default function AdminDoctors() {
           <button
             type="button"
             className="btn btn-outline-secondary rounded-pill px-3 btn-sm d-inline-flex align-items-center gap-1"
-            onClick={fetchDoctors}
-            title="Refresh doctor roster"
+            onClick={() => setPage(1)}
+            title="Refresh list"
           >
             <RefreshCw size={14} />
             <span>Refresh</span>
@@ -175,7 +192,7 @@ export default function AdminDoctors() {
             onClick={() => setIsRegisterOpen(true)}
           >
             <Plus size={16} />
-            <span>Register Doctor</span>
+            <span>Credential Physician</span>
           </button>
         </div>
       </div>
@@ -184,7 +201,7 @@ export default function AdminDoctors() {
       <div className="card border-0 shadow-sm rounded-4 bg-white p-3 mb-4" style={{ border: '1px solid #e2e8f0' }}>
         <div className="row g-3 align-items-center">
           {/* Search */}
-          <div className="col-12 col-md-6">
+          <div className="col-12 col-md-7">
             <div className="input-group">
               <span className="input-group-text bg-white border-end-0 text-muted">
                 <Search size={16} />
@@ -192,35 +209,29 @@ export default function AdminDoctors() {
               <input
                 type="text"
                 className="form-control border-start-0 ps-0"
-                placeholder="Search physician by name, email, or specialty..."
+                placeholder="Search by physician name, specialty, or email..."
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
-              {search && (
-                <button
-                  className="btn btn-link text-muted text-decoration-none"
-                  type="button"
-                  onClick={() => setSearch('')}
-                >
-                  &times;
-                </button>
-              )}
             </div>
           </div>
 
-          {/* Specialization Filter */}
-          <div className="col-12 col-md-6">
+          {/* Specialty Filter */}
+          <div className="col-12 col-md-5">
             <div className="input-group">
               <span className="input-group-text bg-white border-end-0 text-muted">
                 <Filter size={16} />
               </span>
               <select
-                className="form-select border-start-0"
+                className="form-select border-start-0 ps-0"
                 value={selectedSpecialization}
-                onChange={(e) => setSelectedSpecialization(e.target.value)}
+                onChange={(e) => {
+                  setSelectedSpecialization(e.target.value)
+                  setPage(1)
+                }}
               >
-                <option value="ALL">All Specializations</option>
-                {specializations.map((spec) => (
+                <option value="ALL">All Medical Specialties</option>
+                {specializationOptions.map((spec) => (
                   <option key={spec} value={spec}>
                     {spec}
                   </option>
@@ -234,69 +245,66 @@ export default function AdminDoctors() {
       {/* Loading */}
       {loading && (
         <div className="text-center py-5 my-5">
-          <div className="spinner-border text-info mb-3" style={{ width: '3rem', height: '3rem' }} role="status">
+          <div className="spinner-border text-primary mb-3" style={{ width: '3rem', height: '3rem' }} role="status">
             <span className="visually-hidden">Loading...</span>
           </div>
-          <h6 className="text-muted fw-normal">Retrieving medical directory...</h6>
+          <h6 className="text-muted fw-normal">Retrieving physicians directory...</h6>
         </div>
       )}
 
       {/* Error */}
-      {error && !loading && (
-        <div className="alert alert-danger p-4 rounded-4 shadow-sm my-4">
-          <div className="d-flex align-items-center gap-3">
-            <AlertCircle size={28} className="text-danger flex-shrink-0" />
-            <div className="flex-grow-1">
-              <h6 className="fw-bold mb-1">Failed to Load Physicians</h6>
-              <p className="mb-0 small text-danger-emphasis">{error}</p>
-            </div>
-            <button className="btn btn-danger btn-sm px-3 rounded-pill" onClick={fetchDoctors}>
-              Try Again
-            </button>
-          </div>
+      {!loading && error && (
+        <div className="alert alert-danger rounded-4 p-4 shadow-sm text-center" role="alert">
+          <AlertCircle size={32} className="text-danger mb-2" />
+          <h5 className="alert-heading fw-semibold">Error Loading Doctors</h5>
+          <p className="text-muted mb-3">{error}</p>
+          <button className="btn btn-outline-danger rounded-pill px-4 btn-sm" onClick={() => setPage(1)}>
+            Try Again
+          </button>
         </div>
       )}
 
-      {/* Doctor Grid */}
+      {/* Grid of Doctor Cards */}
       {!loading && !error && (
         <div className="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-4 mb-4">
-          {filteredDoctors.length === 0 ? (
+          {doctors.length === 0 ? (
             <div className="col-12 w-100">
-              <div className="card text-center py-5 px-3 border-0 shadow-sm rounded-4 bg-white">
-                <Stethoscope size={40} className="text-muted mx-auto mb-3" />
-                <h5 className="fw-bold text-dark">No Physicians Found</h5>
-                <p className="text-muted small mb-3">No doctors match your active search filters.</p>
-                <button
-                  className="btn btn-primary rounded-pill px-4 btn-sm mx-auto"
-                  onClick={() => setIsRegisterOpen(true)}
-                >
-                  Register New Doctor
-                </button>
+              <div className="card border-0 shadow-sm rounded-4 text-center py-5 px-4 bg-white">
+                <div className="mx-auto mb-3 p-3 rounded-circle bg-light d-inline-block text-muted">
+                  <Stethoscope size={40} />
+                </div>
+                <h5 className="fw-semibold text-dark">No Physicians Found</h5>
+                <p className="text-muted small mx-auto" style={{ maxWidth: '400px' }}>
+                  No doctors match your active search terms or clinical specialization filter.
+                </p>
+                <div className="d-flex justify-content-center gap-2 mt-2">
+                  <button
+                    className="btn btn-light rounded-pill px-3 btn-sm border"
+                    onClick={() => {
+                      setSearch('')
+                      setSelectedSpecialization('ALL')
+                      setPage(1)
+                    }}
+                  >
+                    Reset Filters
+                  </button>
+                  <button className="btn btn-primary rounded-pill px-4 btn-sm" onClick={() => setIsRegisterOpen(true)}>
+                    Register Physician
+                  </button>
+                </div>
               </div>
             </div>
           ) : (
-            filteredDoctors.map((doc) => {
+            doctors.map((doc) => {
               const isActive = (doc.status || '').toLowerCase() === 'active'
               return (
                 <div className="col" key={doc.id}>
                   <div
-                    className="card border-0 shadow-sm rounded-4 h-100 bg-white transition-all overflow-hidden"
-                    style={{
-                      border: '1px solid #e2e8f0',
-                      transition: 'transform 0.2s ease, box-shadow 0.2s ease',
-                      opacity: isActive ? 1 : 0.75,
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.transform = 'translateY(-3px)'
-                      e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(15, 23, 42, 0.08)'
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.transform = 'translateY(0)'
-                      e.currentTarget.style.boxShadow = '0 1px 3px 0 rgba(0, 0, 0, 0.05)'
-                    }}
+                    className="card border-0 shadow-sm rounded-4 h-100 bg-white hover-shadow transition-all"
+                    style={{ border: '1px solid #e2e8f0' }}
                   >
                     <div className="card-body p-4 d-flex flex-column">
-                      {/* Header */}
+                      {/* Top Header */}
                       <div className="d-flex align-items-start justify-content-between mb-3">
                         <div className="d-flex align-items-center gap-3">
                           <div
@@ -380,6 +388,37 @@ export default function AdminDoctors() {
               )
             })
           )}
+        </div>
+      )}
+
+      {/* Pagination Bar */}
+      {!loading && !error && totalPages > 1 && (
+        <div className="d-flex flex-column flex-sm-row align-items-center justify-content-between gap-3 mt-4 px-2">
+          <small className="text-muted">
+            Showing Page <span className="fw-bold text-dark">{page}</span> of{' '}
+            <span className="fw-bold text-dark">{totalPages}</span> ({totalCount} total physicians)
+          </small>
+
+          <div className="btn-group shadow-xs">
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1 px-3"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              <ChevronLeft size={16} />
+              <span>Previous</span>
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1 px-3"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            >
+              <span>Next</span>
+              <ChevronRight size={16} />
+            </button>
+          </div>
         </div>
       )}
 

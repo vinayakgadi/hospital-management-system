@@ -9,13 +9,33 @@ import csv
 import time
 from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, g
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 # Enable CORS for all routes and origins with support for authorization headers
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+@app.before_request
+def before_request_perf():
+    g.start_time = time.time()
+    g.db_query_time = 0.0
+    g.db_query_count = 0
+
+@app.after_request
+def after_request_perf(response):
+    if hasattr(g, "start_time"):
+        total_ms = (time.time() - g.start_time) * 1000.0
+        db_ms = getattr(g, "db_query_time", 0.0) * 1000.0
+        queries = getattr(g, "db_query_count", 0)
+        flask_ms = max(0.0, total_ms - db_ms)
+        response.headers["X-Response-Time-Ms"] = f"{total_ms:.2f}"
+        response.headers["X-DB-Time-Ms"] = f"{db_ms:.2f}"
+        response.headers["X-DB-Queries"] = str(queries)
+        if total_ms > 200 or request.path.startswith("/api/"):
+            print(f"[PERF] {request.method} {request.path} - {total_ms:.1f}ms total (DB: {db_ms:.1f}ms in {queries} queries, Flask: {flask_ms:.1f}ms)")
+    return response
 
 from database import (
     get_db_connection,
@@ -772,7 +792,11 @@ def get_current_user():
     """
     Extracts Bearer token or cookie, checks user_tokens,
     and returns the active user dict with doctor_id/patient_id.
+    Caches result in Flask request context (g.current_user) to avoid redundant DB queries.
     """
+    if hasattr(g, "current_user") and g.current_user is not None:
+        return g.current_user
+
     token = None
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
@@ -839,6 +863,7 @@ def get_current_user():
         "token": token
     }
     conn.close()
+    g.current_user = user
     return user
 
 
@@ -1204,19 +1229,20 @@ def get_admin_dashboard_stats():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM patients")
-    total_patients = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM doctors")
-    total_doctors = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM appointments")
-    total_appointments = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(DISTINCT disease) FROM patients WHERE disease IS NOT NULL AND disease != ''")
-    active_conditions = cursor.fetchone()[0]
-
+    cursor.execute("""
+        SELECT 
+            (SELECT COUNT(*) FROM patients) as total_patients,
+            (SELECT COUNT(*) FROM doctors) as total_doctors,
+            (SELECT COUNT(*) FROM appointments) as total_appointments,
+            (SELECT COUNT(DISTINCT disease) FROM patients WHERE disease IS NOT NULL AND disease != '') as active_conditions
+    """)
+    row = cursor.fetchone()
     conn.close()
+
+    total_patients = row["total_patients"] or 0
+    total_doctors = row["total_doctors"] or 0
+    total_appointments = row["total_appointments"] or 0
+    active_conditions = row["active_conditions"] or 0
 
     return jsonify({
         "total_patients": total_patients,
@@ -1234,32 +1260,47 @@ def get_admin_dashboard_stats():
 
 @app.route("/api/admin/dashboard/patient-trends", methods=["GET"])
 def get_patient_trends():
-    days = request.args.get("days", 7, type=int)
+    days = max(1, min(90, request.args.get("days", 7, type=int)))
     today = datetime.now()
+    earliest_date = today - timedelta(days=days)
+    earliest_str = earliest_date.strftime("%Y-%m-%d")
 
-    trend_data = []
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # Prior cumulative count before earliest_str
+    cursor.execute("SELECT COUNT(*) FROM patients WHERE date(created_at) < date(?)", (earliest_str,))
+    prior_cumulative = cursor.fetchone()[0] or 0
+
+    # Grouped daily registrations in range (1 single query instead of 2*N queries)
+    cursor.execute("""
+        SELECT date(created_at) as day, COUNT(*) as count
+        FROM patients
+        WHERE date(created_at) >= date(?)
+        GROUP BY date(created_at)
+        ORDER BY day ASC
+    """, (earliest_str,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    daily_map = {str(r["day"]): r["count"] for r in rows}
+
+    trend_data = []
+    running_total = prior_cumulative
     for i in range(days - 1, -1, -1):
         target_date = today - timedelta(days=i)
         date_str = target_date.strftime("%Y-%m-%d")
         display_label = target_date.strftime("%b %d")
-
-        cursor.execute("SELECT COUNT(*) FROM patients WHERE date(created_at) = date(?)", (date_str,))
-        count = cursor.fetchone()[0]
-
-        cursor.execute("SELECT COUNT(*) FROM patients WHERE date(created_at) <= date(?)", (date_str,))
-        cumulative = cursor.fetchone()[0]
+        count = daily_map.get(date_str, 0)
+        running_total += count
 
         trend_data.append({
             "date": display_label,
             "full_date": date_str,
-            "count": count if count > 0 else (1 if (i % 2 == 0 and cumulative > 0) else 0),
-            "total_active": max(cumulative, 1 + (days - i))
+            "count": count if count > 0 else (1 if (i % 2 == 0 and running_total > 0) else 0),
+            "total_active": max(running_total, 1 + (days - i))
         })
 
-    conn.close()
     return jsonify(trend_data)
 
 
@@ -1326,10 +1367,25 @@ def get_upcoming_appointments():
         FROM appointments a
         JOIN patients p ON a.patient_id = p.id
         JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.appointment_date >= CURRENT_DATE AND LOWER(a.status) != 'cancelled'
         ORDER BY a.appointment_date ASC, a.appointment_time ASC
         LIMIT ?
     """, (limit,))
     rows = cursor.fetchall()
+
+    if not rows:
+        cursor.execute("""
+            SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.reason,
+                   p.id as patient_id, p.name as patient_name,
+                   d.id as doctor_id, d.name as doctor_name
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            ORDER BY a.appointment_date DESC, a.appointment_time DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+
     conn.close()
 
     appointments = []
@@ -1379,13 +1435,71 @@ def get_recent_activity():
 
 @app.route("/api/doctors", methods=["GET"])
 def get_all_doctors():
+    page_param = request.args.get("page")
+    is_paginated = page_param is not None or request.args.get("paginate") == "true"
+
+    search_term = (request.args.get("search") or request.args.get("q") or "").strip().lower()
+    spec_filter = request.args.get("specialization", "").strip()
+    status_filter = request.args.get("status", "").strip()
+
+    where_clauses = []
+    params = []
+
+    if search_term:
+        term = f"%{search_term}%"
+        where_clauses.append("(LOWER(d.name) LIKE ? OR LOWER(d.email) LIKE ? OR LOWER(d.specialization) LIKE ?)")
+        params.extend([term, term, term])
+
+    if spec_filter and spec_filter.upper() != "ALL":
+        where_clauses.append("LOWER(d.specialization) = ?")
+        params.append(spec_filter.lower())
+
+    if status_filter and status_filter.upper() != "ALL":
+        where_clauses.append("LOWER(d.status) = ?")
+        params.append(status_filter.lower())
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM doctors ORDER BY id ASC")
-    rows = cursor.fetchall()
-    conn.close()
 
-    return jsonify([row_to_doctor_dict(r) for r in rows])
+    if is_paginated:
+        page = max(1, int(page_param or 1))
+        per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 12)))
+        offset = (page - 1) * per_page
+
+        cursor.execute(f"SELECT COUNT(*) FROM doctors d {where_sql}", params)
+        total = cursor.fetchone()[0]
+
+        cursor.execute(f"""
+            SELECT d.* FROM doctors d
+            {where_sql}
+            ORDER BY d.id ASC
+            LIMIT ? OFFSET ?
+        """, params + [per_page, offset])
+        rows = cursor.fetchall()
+
+        cursor.execute("SELECT DISTINCT specialization FROM doctors WHERE specialization IS NOT NULL AND specialization != '' ORDER BY specialization ASC")
+        specs = [r[0] for r in cursor.fetchall() if r[0]]
+
+        conn.close()
+
+        doctors = [row_to_doctor_dict(r) for r in rows]
+        total_pages = max(1, math.ceil(total / per_page))
+
+        return jsonify({
+            "doctors": doctors,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "specializations": specs
+        })
+    else:
+        cursor.execute(f"SELECT d.* FROM doctors d {where_sql} ORDER BY d.id ASC", params)
+        rows = cursor.fetchall()
+        conn.close()
+        return jsonify([row_to_doctor_dict(r) for r in rows])
 
 
 @app.route("/api/doctors", methods=["POST"])
@@ -1444,34 +1558,120 @@ def register_doctor(current_user):
 
 @app.route("/api/appointments", methods=["GET"])
 def get_all_appointments():
+    page_param = request.args.get("page")
+    is_paginated = page_param is not None or request.args.get("paginate") == "true"
+
+    status_filter = request.args.get("status", "").strip()
+    search_term = (request.args.get("search") or request.args.get("q") or "").strip().lower()
+    start_date = request.args.get("startDate", "").strip()
+    end_date = request.args.get("endDate", "").strip()
+    sort_dir = request.args.get("sort", "asc").strip().lower()
+    if sort_dir not in ["asc", "desc"]:
+        sort_dir = "asc"
+
+    where_clauses = []
+    params = []
+
+    if status_filter and status_filter.upper() != "ALL":
+        where_clauses.append("LOWER(a.status) = ?")
+        params.append(status_filter.lower())
+
+    if search_term:
+        term = f"%{search_term}%"
+        where_clauses.append("(LOWER(p.name) LIKE ? OR LOWER(d.name) LIKE ? OR LOWER(COALESCE(a.reason, '')) LIKE ?)")
+        params.extend([term, term, term])
+
+    if start_date:
+        where_clauses.append("a.appointment_date >= ?")
+        params.append(start_date)
+
+    if end_date:
+        where_clauses.append("a.appointment_date <= ?")
+        params.append(end_date)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT a.*, p.name as patient_name, d.name as doctor_name, d.specialization as doctor_specialization
-        FROM appointments a
-        JOIN patients p ON a.patient_id = p.id
-        JOIN doctors d ON a.doctor_id = d.id
-        ORDER BY a.appointment_date ASC, a.appointment_time ASC
-    """)
-    rows = cursor.fetchall()
-    conn.close()
 
-    appointments = []
-    for r in rows:
-        appointments.append({
-            "id": r["id"],
-            "patient_id": r["patient_id"],
-            "patient_name": r["patient_name"],
-            "doctor_id": r["doctor_id"],
-            "doctor_name": r["doctor_name"],
-            "doctor_specialization": r["doctor_specialization"],
-            "appointment_date": r["appointment_date"],
-            "appointment_time": r["appointment_time"],
-            "status": r["status"],
-            "reason": r["reason"] or "General Checkup",
-            "created_at": r["created_at"],
+    if is_paginated:
+        page = max(1, int(page_param or 1))
+        per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 15)))
+        offset = (page - 1) * per_page
+
+        cursor.execute(f"""
+            SELECT COUNT(*)
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            {where_sql}
+        """, params)
+        total = cursor.fetchone()[0]
+
+        cursor.execute(f"""
+            SELECT a.*, p.name as patient_name, d.name as doctor_name, d.specialization as doctor_specialization
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            {where_sql}
+            ORDER BY a.appointment_date {sort_dir.upper()}, a.appointment_time {sort_dir.upper()}
+            LIMIT ? OFFSET ?
+        """, params + [per_page, offset])
+        rows = cursor.fetchall()
+        conn.close()
+
+        appointments = []
+        for r in rows:
+            appointments.append({
+                "id": r["id"],
+                "patient_id": r["patient_id"],
+                "patient_name": r["patient_name"],
+                "doctor_id": r["doctor_id"],
+                "doctor_name": r["doctor_name"],
+                "doctor_specialization": r["doctor_specialization"],
+                "appointment_date": r["appointment_date"],
+                "appointment_time": r["appointment_time"],
+                "status": r["status"],
+                "reason": r["reason"] or "General Checkup",
+                "created_at": r["created_at"],
+            })
+
+        total_pages = max(1, math.ceil(total / per_page))
+        return jsonify({
+            "appointments": appointments,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages
         })
-    return jsonify(appointments)
+    else:
+        cursor.execute(f"""
+            SELECT a.*, p.name as patient_name, d.name as doctor_name, d.specialization as doctor_specialization
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            {where_sql}
+            ORDER BY a.appointment_date {sort_dir.upper()}, a.appointment_time {sort_dir.upper()}
+        """, params)
+        rows = cursor.fetchall()
+        conn.close()
+
+        appointments = []
+        for r in rows:
+            appointments.append({
+                "id": r["id"],
+                "patient_id": r["patient_id"],
+                "patient_name": r["patient_name"],
+                "doctor_id": r["doctor_id"],
+                "doctor_name": r["doctor_name"],
+                "doctor_specialization": r["doctor_specialization"],
+                "appointment_date": r["appointment_date"],
+                "appointment_time": r["appointment_time"],
+                "status": r["status"],
+                "reason": r["reason"] or "General Checkup",
+                "created_at": r["created_at"],
+            })
+        return jsonify(appointments)
 
 
 @app.route("/api/appointments", methods=["POST"])
@@ -3148,15 +3348,80 @@ def get_patient_dashboard(current_user, patient_id):
 # ---------------------------------------------------------
 
 @app.route("/patients", methods=["GET"])
+@app.route("/api/patients", methods=["GET"])
 def get_patients():
+    page_param = request.args.get("page")
+    is_paginated = page_param is not None or request.args.get("paginate") == "true"
+
+    search_term = (request.args.get("search") or request.args.get("q") or "").strip().lower()
+    disease_filter = request.args.get("disease", "").strip()
+    sort_by = request.args.get("sort", "name-asc").strip().lower()
+
+    where_clauses = []
+    params = []
+
+    if search_term:
+        term = f"%{search_term}%"
+        where_clauses.append("(LOWER(p.name) LIKE ? OR LOWER(p.email) LIKE ? OR LOWER(COALESCE(p.doctor_name, '')) LIKE ? OR LOWER(COALESCE(p.disease, '')) LIKE ?)")
+        params.extend([term, term, term, term])
+
+    if disease_filter and disease_filter.upper() != "ALL":
+        where_clauses.append("LOWER(p.disease) = ?")
+        params.append(disease_filter.lower())
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    sort_order_map = {
+        "name-asc": "p.name ASC",
+        "name-desc": "p.name DESC",
+        "age-asc": "p.age ASC",
+        "age-desc": "p.age DESC",
+        "id-asc": "p.id ASC",
+        "id-desc": "p.id DESC"
+    }
+    order_by_sql = sort_order_map.get(sort_by, "p.id DESC")
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM patients ORDER BY id DESC")
-    rows = cursor.fetchall()
-    conn.close()
 
-    patients = [row_to_patient_dict(row) for row in rows]
-    return jsonify(patients)
+    if is_paginated:
+        page = max(1, int(page_param or 1))
+        per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 12)))
+        offset = (page - 1) * per_page
+
+        cursor.execute(f"SELECT COUNT(*) FROM patients p {where_sql}", params)
+        total = cursor.fetchone()[0]
+
+        cursor.execute(f"""
+            SELECT p.* FROM patients p
+            {where_sql}
+            ORDER BY {order_by_sql}
+            LIMIT ? OFFSET ?
+        """, params + [per_page, offset])
+        rows = cursor.fetchall()
+
+        cursor.execute("SELECT DISTINCT disease FROM patients WHERE disease IS NOT NULL AND disease != '' ORDER BY disease ASC")
+        diseases = [r[0] for r in cursor.fetchall() if r[0]]
+
+        conn.close()
+
+        patients = [row_to_patient_dict(row) for row in rows]
+        total_pages = max(1, math.ceil(total / per_page))
+
+        return jsonify({
+            "patients": patients,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "diseases": diseases
+        })
+    else:
+        cursor.execute(f"SELECT p.* FROM patients p {where_sql} ORDER BY {order_by_sql}", params)
+        rows = cursor.fetchall()
+        conn.close()
+        patients = [row_to_patient_dict(row) for row in rows]
+        return jsonify(patients)
 
 
 @app.route("/patients/<int:patient_id>", methods=["GET"])

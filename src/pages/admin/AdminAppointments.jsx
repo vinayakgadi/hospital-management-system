@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect } from 'react'
 import axios from 'axios'
 import { API_BASE_URL } from '../../config.js'
 import ScheduleAppointmentModal from '../../components/modals/ScheduleAppointmentModal.jsx'
@@ -15,6 +15,8 @@ import {
   XCircle,
   AlertCircle,
   Check,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react'
 
 export default function AdminAppointments() {
@@ -23,34 +25,74 @@ export default function AdminAppointments() {
   const [error, setError] = useState(null)
   const [statusFilter, setStatusFilter] = useState('ALL')
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [isScheduleOpen, setIsScheduleOpen] = useState(false)
   const [updatingId, setUpdatingId] = useState(null)
   const [toast, setToast] = useState(null)
+
+  // Server-side pagination
+  const [page, setPage] = useState(1)
+  const [perPage] = useState(15)
+  const [totalPages, setTotalPages] = useState(1)
+  const [totalCount, setTotalCount] = useState(0)
+
+  // Debounce search
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search)
+      setPage(1)
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [search])
 
   const showToast = (message, type = 'success') => {
     setToast({ message, type })
     setTimeout(() => setToast(null), 4000)
   }
 
-  const fetchAppointments = () => {
+  // Fetch paginated appointments from server with cancellation
+  useEffect(() => {
+    const controller = new AbortController()
     setLoading(true)
     setError(null)
+
+    const params = {
+      page,
+      per_page: perPage,
+      search: debouncedSearch,
+      status: statusFilter !== 'ALL' ? statusFilter : undefined,
+    }
+
     axios
-      .get(`${API_BASE_URL}/api/appointments`)
+      .get(`${API_BASE_URL}/api/appointments`, {
+        params,
+        signal: controller.signal,
+      })
       .then((res) => {
-        setAppointments(Array.isArray(res.data) ? res.data : [])
+        if (res.data && typeof res.data === 'object' && !Array.isArray(res.data)) {
+          setAppointments(res.data.appointments || [])
+          setTotalCount(res.data.total || 0)
+          setTotalPages(res.data.total_pages || 1)
+        } else if (Array.isArray(res.data)) {
+          setAppointments(res.data)
+          setTotalCount(res.data.length)
+          setTotalPages(1)
+        }
         setLoading(false)
       })
       .catch((err) => {
+        if (axios.isCancel(err) || err.name === 'CanceledError') {
+          return
+        }
         console.error('Failed to load appointments:', err)
         setError('Unable to load appointments schedule.')
         setLoading(false)
       })
-  }
 
-  useEffect(() => {
-    fetchAppointments()
-  }, [])
+    return () => {
+      controller.abort()
+    }
+  }, [page, perPage, debouncedSearch, statusFilter])
 
   const handleStatusChange = async (appointmentId, newStatus) => {
     setUpdatingId(appointmentId)
@@ -70,22 +112,10 @@ export default function AdminAppointments() {
     }
   }
 
-  const handleAppointmentScheduled = (newApp) => {
-    fetchAppointments()
+  const handleAppointmentScheduled = () => {
+    setPage(1)
     showToast(`Appointment scheduled successfully!`)
   }
-
-  const filteredAppointments = useMemo(() => {
-    return appointments.filter((app) => {
-      const matchStatus = statusFilter === 'ALL' || app.status === statusFilter
-      const matchSearch =
-        (app.patient_name || '').toLowerCase().includes(search.toLowerCase()) ||
-        (app.doctor_name || '').toLowerCase().includes(search.toLowerCase()) ||
-        (app.reason || '').toLowerCase().includes(search.toLowerCase())
-
-      return matchStatus && matchSearch
-    })
-  }, [appointments, statusFilter, search])
 
   const getStatusBadge = (status) => {
     switch (status) {
@@ -128,7 +158,7 @@ export default function AdminAppointments() {
         <div>
           <h2 className="h4 fw-bold text-dark mb-1">Appointments Schedule</h2>
           <p className="text-muted small mb-0">
-            Clinical consultations, patient visits, and physician schedules
+            {totalCount} total booked consultation{totalCount === 1 ? '' : 's'} across all departments
           </p>
         </div>
 
@@ -136,7 +166,7 @@ export default function AdminAppointments() {
           <button
             type="button"
             className="btn btn-outline-secondary rounded-pill px-3 btn-sm d-inline-flex align-items-center gap-1"
-            onClick={fetchAppointments}
+            onClick={() => setPage(1)}
             title="Refresh schedule"
           >
             <RefreshCw size={14} />
@@ -153,7 +183,7 @@ export default function AdminAppointments() {
         </div>
       </div>
 
-      {/* Filters */}
+      {/* Filters Toolbar */}
       <div className="card border-0 shadow-sm rounded-4 bg-white p-3 mb-4" style={{ border: '1px solid #e2e8f0' }}>
         <div className="row g-3 align-items-center">
           {/* Search */}
@@ -182,7 +212,10 @@ export default function AdminAppointments() {
                   className={`btn rounded-pill px-2 py-1 small fw-medium ${
                     statusFilter === st ? 'btn-primary' : 'btn-light border-0 text-secondary'
                   }`}
-                  onClick={() => setStatusFilter(st)}
+                  onClick={() => {
+                    setStatusFilter(st)
+                    setPage(1)
+                  }}
                 >
                   {st === 'ALL' ? 'All Statuses' : st}
                 </button>
@@ -199,6 +232,18 @@ export default function AdminAppointments() {
             <span className="visually-hidden">Loading...</span>
           </div>
           <h6 className="text-muted fw-normal">Retrieving appointment schedule...</h6>
+        </div>
+      )}
+
+      {/* Error */}
+      {!loading && error && (
+        <div className="alert alert-danger rounded-4 p-4 shadow-sm text-center" role="alert">
+          <AlertCircle size={32} className="text-danger mb-2" />
+          <h5 className="alert-heading fw-semibold">Error Loading Appointments</h5>
+          <p className="text-muted mb-3">{error}</p>
+          <button className="btn btn-outline-danger rounded-pill px-4 btn-sm" onClick={() => setPage(1)}>
+            Try Again
+          </button>
         </div>
       )}
 
@@ -219,16 +264,16 @@ export default function AdminAppointments() {
                 </tr>
               </thead>
               <tbody>
-                {filteredAppointments.length === 0 ? (
+                {appointments.length === 0 ? (
                   <tr>
                     <td colSpan="7" className="text-center py-5 text-muted">
-                      No appointments match the selected filters.
+                      No appointments found matching current filters.
                     </td>
                   </tr>
                 ) : (
-                  filteredAppointments.map((app) => (
+                  appointments.map((app) => (
                     <tr key={app.id}>
-                      <td className="ps-4 text-muted fw-medium">#{app.id}</td>
+                      <td className="ps-4 fw-medium text-muted">#{app.id}</td>
                       <td>
                         <div className="d-flex align-items-center gap-2">
                           <div
@@ -242,26 +287,42 @@ export default function AdminAppointments() {
                           >
                             {(app.patient_name || 'P').slice(0, 2).toUpperCase()}
                           </div>
-                          <span className="fw-semibold text-dark">{app.patient_name}</span>
+                          <div>
+                            <span className="fw-semibold text-dark d-block" style={{ fontSize: '0.85rem' }}>
+                              {app.patient_name}
+                            </span>
+                            <small className="text-muted">ID: #{app.patient_id}</small>
+                          </div>
                         </div>
                       </td>
                       <td>
-                        <span className="fw-medium text-dark d-block" style={{ fontSize: '0.85rem' }}>
-                          Dr. {app.doctor_name}
+                        <div className="d-flex align-items-center gap-1.5">
+                          <Stethoscope size={14} className="text-primary flex-shrink-0" />
+                          <span className="fw-medium text-dark" style={{ fontSize: '0.85rem' }}>
+                            {app.doctor_name}
+                          </span>
+                        </div>
+                        {app.doctor_specialization && (
+                          <small className="text-muted d-block ps-4">{app.doctor_specialization}</small>
+                        )}
+                      </td>
+                      <td>
+                        <div className="d-flex align-items-center gap-1 text-dark" style={{ fontSize: '0.85rem' }}>
+                          <Calendar size={13} className="text-muted" />
+                          <span>{app.appointment_date}</span>
+                        </div>
+                        <div className="d-flex align-items-center gap-1 text-muted" style={{ fontSize: '0.75rem' }}>
+                          <Clock size={12} />
+                          <span>{app.appointment_time}</span>
+                        </div>
+                      </td>
+                      <td>
+                        <span className="text-dark small d-inline-block text-truncate" style={{ maxWidth: '180px' }}>
+                          {app.reason}
                         </span>
-                        <small className="text-muted">{app.doctor_specialization || 'General Care'}</small>
                       </td>
                       <td>
-                        <span className="d-block fw-medium text-dark" style={{ fontSize: '0.85rem' }}>
-                          {app.appointment_date}
-                        </span>
-                        <small className="text-muted">{app.appointment_time}</small>
-                      </td>
-                      <td>
-                        <span className="text-secondary small">{app.reason || 'Routine Consultation'}</span>
-                      </td>
-                      <td>
-                        <span className={`badge rounded-pill px-2.5 py-1 ${getStatusBadge(app.status)}`}>
+                        <span className={`badge rounded-pill px-2.5 py-1 small fw-medium ${getStatusBadge(app.status)}`}>
                           {app.status}
                         </span>
                       </td>
@@ -306,6 +367,37 @@ export default function AdminAppointments() {
                 )}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* Pagination Bar */}
+      {!loading && !error && totalPages > 1 && (
+        <div className="d-flex flex-column flex-sm-row align-items-center justify-content-between gap-3 mt-4 px-2">
+          <small className="text-muted">
+            Showing Page <span className="fw-bold text-dark">{page}</span> of{' '}
+            <span className="fw-bold text-dark">{totalPages}</span> ({totalCount} total appointments)
+          </small>
+
+          <div className="btn-group shadow-xs">
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1 px-3"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              <ChevronLeft size={16} />
+              <span>Previous</span>
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1 px-3"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            >
+              <span>Next</span>
+              <ChevronRight size={16} />
+            </button>
           </div>
         </div>
       )}

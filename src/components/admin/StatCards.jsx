@@ -8,22 +8,27 @@ export default function StatCards({ refreshTrigger }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
-  const fetchStats = async () => {
+  useEffect(() => {
+    const controller = new AbortController()
     setLoading(true)
     setError(null)
-    try {
-      const res = await axios.get(`${API_BASE_URL}/api/admin/dashboard/stats`)
-      setStats(res.data)
-    } catch (err) {
-      console.error('Failed to fetch stats:', err)
-      setError('Unable to load metrics')
-    } finally {
-      setLoading(false)
-    }
-  }
 
-  useEffect(() => {
-    fetchStats()
+    axios
+      .get(`${API_BASE_URL}/api/admin/dashboard/stats`, { signal: controller.signal })
+      .then((res) => {
+        setStats(res.data)
+        setLoading(false)
+      })
+      .catch((err) => {
+        if (axios.isCancel(err) || err.name === 'CanceledError') return
+        console.error('Failed to fetch stats:', err)
+        setError('Unable to load metrics')
+        setLoading(false)
+      })
+
+    return () => {
+      controller.abort()
+    }
   }, [refreshTrigger])
 
   const cards = [

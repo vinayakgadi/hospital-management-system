@@ -25,43 +25,45 @@ export default function AnalyticsCharts({ refreshTrigger }) {
 
   // Fetch patient registration trends
   useEffect(() => {
-    let isMounted = true
+    const controller = new AbortController()
     setLoadingTrends(true)
     axios
-      .get(`${API_BASE_URL}/api/admin/dashboard/patient-trends?days=${trendDays}`)
+      .get(`${API_BASE_URL}/api/admin/dashboard/patient-trends?days=${trendDays}`, {
+        signal: controller.signal,
+      })
       .then((res) => {
-        if (isMounted) {
-          setTrendData(Array.isArray(res.data) ? res.data : [])
-          setLoadingTrends(false)
-        }
+        setTrendData(Array.isArray(res.data) ? res.data : [])
+        setLoadingTrends(false)
       })
       .catch((err) => {
+        if (axios.isCancel(err) || err.name === 'CanceledError') return
         console.error('Failed to load patient trends:', err)
-        if (isMounted) setLoadingTrends(false)
+        setLoadingTrends(false)
       })
     return () => {
-      isMounted = false
+      controller.abort()
     }
   }, [trendDays, refreshTrigger])
 
   // Fetch appointment status overview
   useEffect(() => {
-    let isMounted = true
+    const controller = new AbortController()
     setLoadingAppointments(true)
     axios
-      .get(`${API_BASE_URL}/api/admin/dashboard/appointment-stats`)
+      .get(`${API_BASE_URL}/api/admin/dashboard/appointment-stats`, {
+        signal: controller.signal,
+      })
       .then((res) => {
-        if (isMounted) {
-          setAppointmentStats(Array.isArray(res.data) ? res.data : [])
-          setLoadingAppointments(false)
-        }
+        setAppointmentStats(Array.isArray(res.data) ? res.data : [])
+        setLoadingAppointments(false)
       })
       .catch((err) => {
+        if (axios.isCancel(err) || err.name === 'CanceledError') return
         console.error('Failed to load appointment stats:', err)
-        if (isMounted) setLoadingAppointments(false)
+        setLoadingAppointments(false)
       })
     return () => {
-      isMounted = false
+      controller.abort()
     }
   }, [refreshTrigger])
 
