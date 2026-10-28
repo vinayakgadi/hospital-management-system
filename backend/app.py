@@ -14,13 +14,14 @@ app = Flask(__name__)
 # Enable CORS for all routes and origins with support for authorization headers
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
+from database import (
+    get_db_connection,
+    is_postgres_configured,
+    get_active_db_engine,
+    test_database_connection
+)
+
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patients.db")
-
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 # ---------------------------------------------------------
@@ -28,6 +29,18 @@ def get_db_connection():
 # ---------------------------------------------------------
 
 def init_db():
+    if is_postgres_configured():
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM users LIMIT 1;")
+            conn.close()
+            print("[OK] HealthPulse active database engine: PostgreSQL")
+            return
+        except Exception as e:
+            print(f"[INFO] PostgreSQL configuration detected. Run 'python backend/migrate_to_postgres.py' to complete migration: {e}")
+            return
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -789,7 +802,14 @@ def get_current_user():
         return None
 
     # Check token expiration
-    expires_at = datetime.strptime(user_row["expires_at"], "%Y-%m-%d %H:%M:%S")
+    raw_exp = user_row["expires_at"]
+    if isinstance(raw_exp, datetime):
+        expires_at = raw_exp
+    else:
+        try:
+            expires_at = datetime.strptime(str(raw_exp), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            expires_at = datetime.utcnow() + timedelta(hours=1)
     if expires_at < datetime.utcnow():
         cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
         conn.commit()
@@ -868,8 +888,17 @@ def home():
         "service": "HealthPulse Professional Healthcare Security API",
         "version": "2.2.0",
         "security": "Role-Based Access Control Active",
-        "roles_supported": ["admin", "doctor", "patient"]
+        "roles_supported": ["admin", "doctor", "patient"],
+        "database_engine": get_active_db_engine()
     })
+
+
+@app.route("/api/system/database-status", methods=["GET"])
+def api_database_status():
+    status = test_database_connection()
+    status_code = 200 if status.get("connected") else 500
+    return jsonify(status), status_code
+
 
 
 @app.route("/api/auth/login", methods=["POST"])
