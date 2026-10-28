@@ -100,6 +100,228 @@
   animation: pulse-ring 2s infinite;
 }
 
+/* ============================================================
+   EMR (Electronic Medical Records) Modal Styles
+   ============================================================ */
+
+.emr-modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  background-color: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(4px);
+  z-index: 1060;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.emr-modal-container {
+  width: min(1180px, calc(100vw - 32px));
+  max-width: min(1180px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  background: #ffffff;
+  border-radius: 1rem;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+  border: 1px solid rgba(226, 232, 240, 0.8);
+}
+
+.emr-modal-container *,
+.emr-modal-container *::before,
+.emr-modal-container *::after {
+  box-sizing: border-box;
+}
+
+.emr-modal-header {
+  flex: 0 0 auto;
+  background: #ffffff;
+  border-bottom: 1px solid #e2e8f0;
+  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.emr-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: 1.5rem;
+  background-color: #f8fafc;
+}
+
+.emr-modal-footer {
+  flex: 0 0 auto;
+  background: #ffffff;
+  border-top: 1px solid #e2e8f0;
+  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+/* Participants (Patient & Doctor) Responsive Grid */
+.emr-participants-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+@media (max-width: 768px) {
+  .emr-participants-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.emr-info-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+.emr-info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.83rem;
+}
+
+.emr-info-label {
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+.emr-info-value {
+  color: #0f172a;
+  text-align: right;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Vital Signs Responsive Grid */
+.emr-vitals-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+@media (max-width: 1100px) {
+  .emr-vitals-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .emr-vitals-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.emr-vital-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.65rem;
+  padding: 0.75rem 0.5rem;
+  text-align: center;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.02);
+}
+
+.emr-vital-label {
+  font-size: 0.72rem;
+  color: #64748b;
+  margin-bottom: 0.25rem;
+  overflow-wrap: break-word;
+  line-height: 1.2;
+}
+
+.emr-vital-value {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.2;
+  margin-bottom: 0.15rem;
+  overflow-wrap: anywhere;
+}
+
+.emr-vital-unit {
+  font-size: 0.68rem;
+  color: #94a3b8;
+}
+
+/* Clinical Documentation Sections */
+.emr-soap-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+@media (max-width: 768px) {
+  .emr-soap-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.emr-soap-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+  min-width: 0;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03);
+}
+
+.emr-soap-card.full-width {
+  grid-column: 1 / -1;
+}
+
+.emr-soap-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #0284c7;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.emr-soap-content {
+  font-size: 0.86rem;
+  color: #1e293b;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  margin-bottom: 0;
+}
+
 /* Print Styles for Official Prescriptions */
 @media print {
   body * {
