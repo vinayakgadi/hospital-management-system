@@ -193,7 +193,7 @@ export default function PatientLogin() {
         <div className="text-center mt-4">
           <small className="text-white-50 d-inline-flex align-items-center gap-1">
             <HeartPulse size={14} className="text-success" />
-            <span>Encrypted Health Records & Patient Privacy Guaranteed</span>
+            <span>Firebase Authentication &bull; Encrypted Health Records &amp; Privacy</span>
           </small>
         </div>
       </div>

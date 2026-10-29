@@ -34,3 +34,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+*serviceAccount*.json
+*service-account*.json
+firebase-adminsdk*.json
+credentials.json

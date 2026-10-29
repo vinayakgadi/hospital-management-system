@@ -193,7 +193,7 @@ export default function DoctorLogin() {
         <div className="text-center mt-4">
           <small className="text-white-50 d-inline-flex align-items-center gap-1">
             <HeartPulse size={14} className="text-info" />
-            <span>Encrypted Clinical Records & Telehealth Gateway</span>
+            <span>Firebase Authentication &bull; Encrypted Clinical Records</span>
           </small>
         </div>
       </div>
