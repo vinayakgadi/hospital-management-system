@@ -9,7 +9,7 @@ import csv
 import time
 from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, request, jsonify, make_response, g
+from flask import Flask, request, jsonify, make_response, g, redirect
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -1429,9 +1429,11 @@ def auth_register_patient():
         return jsonify({"error": "Failed to create patient account. Please try again."}), 500
 
 
-# Backward-compatible legacy login route
-@app.route("/login", methods=["POST"])
+# Backward-compatible legacy login route & browser redirect
+@app.route("/login", methods=["GET", "POST"])
 def legacy_login():
+    if request.method == "GET":
+        return redirect("http://localhost:5173/login", code=302)
     return auth_login()
 
 
