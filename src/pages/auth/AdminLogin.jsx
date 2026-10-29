@@ -193,7 +193,7 @@ export default function AdminLogin() {
         <div className="text-center mt-4">
           <small className="text-white-50 d-inline-flex align-items-center gap-1">
             <HeartPulse size={14} className="text-danger" />
-            <span>Firebase Authentication &bull; HIPAA-Compliant RBAC Active</span>
+            <span>PostgreSQL Encrypted Auth &bull; HIPAA-Compliant RBAC Active</span>
           </small>
         </div>
       </div>

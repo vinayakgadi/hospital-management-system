@@ -43,7 +43,6 @@ from database import (
     get_active_db_engine,
     test_database_connection
 )
-from firebase_auth import verify_firebase_id_token, initialize_firebase
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patients.db")
 
@@ -798,8 +797,8 @@ init_db()
 
 def get_current_user():
     """
-    Extracts Bearer token or cookie, verifies against Firebase ID Token
-    or user_tokens session table, and returns the active user dict with doctor_id/patient_id.
+    Extracts Bearer token or cookie, verifies against PostgreSQL user_tokens session table,
+    and returns the active user dict with doctor_id/patient_id.
     Caches result in Flask request context (g.current_user) to avoid redundant DB queries.
     Sets g.auth_error if account is inactive or token invalid.
     """
@@ -816,73 +815,38 @@ def get_current_user():
     if not token:
         return None
 
-    # 1. Try Firebase ID Token verification
-    firebase_claims = None
-    try:
-        firebase_claims = verify_firebase_id_token(token)
-    except Exception:
-        firebase_claims = None
-
     conn = get_db_connection()
     cursor = conn.cursor()
-    user_row = None
 
-    if firebase_claims:
-        f_uid = firebase_claims.get("uid")
-        f_email = (firebase_claims.get("email") or "").strip().lower()
-
-        # Look up user by firebase_uid OR email
-        cursor.execute("""
-            SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.firebase_uid,
-                   d.id as doctor_id, d.specialization as doctor_specialization,
-                   p.id as patient_id
-            FROM users u
-            LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
-            LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
-            WHERE u.firebase_uid = ? OR (LOWER(u.email) = ? AND (? != ''))
-            LIMIT 1
-        """, (f_uid, f_email, f_email))
-        user_row = cursor.fetchone()
-
-        # Auto-link firebase_uid if found by email but firebase_uid not yet saved
-        if user_row and not user_row.get("firebase_uid") and f_uid:
-            try:
-                cursor.execute("UPDATE users SET firebase_uid = ? WHERE id = ?", (f_uid, user_row["id"]))
-                conn.commit()
-            except Exception as link_err:
-                print(f"[AUTH] Auto-link notice: {link_err}")
-    else:
-        # 2. Fall back to user_tokens table for legacy/session tokens
-        cursor.execute("""
-            SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.firebase_uid,
-                   t.token, t.expires_at,
-                   d.id as doctor_id, d.specialization as doctor_specialization,
-                   p.id as patient_id
-            FROM user_tokens t
-            JOIN users u ON t.user_id = u.id
-            LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
-            LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
-            WHERE t.token = ?
-        """, (token,))
-        user_row = cursor.fetchone()
-
-        if user_row:
-            # Check token expiration
-            raw_exp = user_row["expires_at"]
-            if isinstance(raw_exp, datetime):
-                expires_at = raw_exp
-            else:
-                try:
-                    expires_at = datetime.strptime(str(raw_exp), "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    expires_at = datetime.utcnow() + timedelta(hours=1)
-            if expires_at < datetime.utcnow():
-                cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
-                conn.commit()
-                conn.close()
-                return None
+    cursor.execute("""
+        SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at,
+               t.token, t.expires_at,
+               d.id as doctor_id, d.specialization as doctor_specialization,
+               p.id as patient_id
+        FROM user_tokens t
+        JOIN users u ON t.user_id = u.id
+        LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+        LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+        WHERE t.token = ?
+    """, (token,))
+    user_row = cursor.fetchone()
 
     if not user_row:
+        conn.close()
+        return None
+
+    # Check token expiration
+    raw_exp = user_row["expires_at"]
+    if isinstance(raw_exp, datetime):
+        expires_at = raw_exp
+    else:
+        try:
+            expires_at = datetime.strptime(str(raw_exp), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            expires_at = datetime.utcnow() + timedelta(hours=1)
+    if expires_at < datetime.utcnow():
+        cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
+        conn.commit()
         conn.close()
         return None
 
@@ -904,7 +868,6 @@ def get_current_user():
         "doctor_id": user_row["doctor_id"],
         "doctor_specialization": user_row["doctor_specialization"],
         "patient_id": user_row["patient_id"],
-        "firebase_uid": user_row.get("firebase_uid"),
         "token": token
     }
     conn.close()
@@ -1111,220 +1074,67 @@ def auth_login():
     return resp
 
 
-@app.route("/api/auth/firebase-login", methods=["POST"])
-def auth_firebase_login():
-    """
-    Handles authentication via Firebase ID Token.
-    1. Validates ID Token with Firebase Admin SDK (or dev mock token).
-    2. Identifies user by firebase_uid or verified email in PostgreSQL.
-    3. Enforces account active check (HTTP 403 if deactivated).
-    4. Enforces portal role restriction (HTTP 403 on cross-portal attempt).
-    5. Links firebase_uid to users table if not already linked.
-    6. Returns user profile, role, session token, and sets cookie.
-    """
-    data = request.get_json(silent=True) or {}
-    id_token_str = (data.get("idToken") or data.get("token") or "").strip()
-    portal_requested = (data.get("role") or "").strip().lower()
-
-    if not id_token_str:
-        return jsonify({"error": "Firebase ID Token is required."}), 400
-
-    try:
-        claims = verify_firebase_id_token(id_token_str)
-    except ValueError as e:
-        return jsonify({"error": f"Invalid or expired Firebase token: {str(e)}"}), 401
-    except Exception as e:
-        return jsonify({"error": f"Token verification error: {str(e)}"}), 401
-
-    f_uid = claims.get("uid")
-    f_email = (claims.get("email") or "").strip().lower()
-
-    if not f_uid and not f_email:
-        return jsonify({"error": "Firebase token missing uid and email."}), 401
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    # Look up user by firebase_uid OR email
-    cursor.execute("""
-        SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.firebase_uid,
-               d.id as doctor_id, d.specialization as doctor_specialization,
-               p.id as patient_id
-        FROM users u
-        LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
-        LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
-        WHERE u.firebase_uid = ? OR (LOWER(u.email) = ? AND (? != ''))
-        LIMIT 1
-    """, (f_uid, f_email, f_email))
-    user = cursor.fetchone()
-
-    # If user doesn't exist in DB yet:
-    if not user:
-        # Check if portal_requested is patient: auto-provision a patient account
-        if portal_requested == "patient":
-            display_name = (data.get("name") or "").strip() or (f_email.split("@")[0].replace(".", " ").title() if f_email else "Patient")
-            try:
-                dummy_hash = generate_password_hash(secrets.token_hex(16))
-                cursor.execute("""
-                    INSERT INTO users (name, email, password_hash, role, is_active, firebase_uid)
-                    VALUES (?, ?, ?, 'patient', 1, ?)
-                """, (display_name, f_email, dummy_hash, f_uid))
-                new_user_id = cursor.lastrowid
-
-                # Link with patient profile
-                cursor.execute("""
-                    INSERT INTO patients (
-                        user_id, name, weight, gender, age, email, password, disease,
-                        doctor_id, doctor_name, doctor_specialization, role
-                    ) VALUES (?, ?, '70', 'Male', '30', ?, ?, 'General Wellness', 1, 'Dr. Satya Deep', 'Cardiology', 'Patient')
-                """, (new_user_id, display_name, f_email, dummy_hash))
-                new_patient_id = cursor.lastrowid
-                conn.commit()
-
-                cursor.execute("""
-                    SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.firebase_uid,
-                           NULL as doctor_id, NULL as doctor_specialization,
-                           p.id as patient_id
-                    FROM users u
-                    LEFT JOIN patients p ON p.user_id = u.id
-                    WHERE u.id = ?
-                """, (new_user_id,))
-                user = cursor.fetchone()
-                log_activity("PATIENT_FIREBASE_REGISTER", f"Patient {display_name} registered via Firebase", "Patient", new_patient_id, display_name, "Patient")
-            except Exception as reg_err:
-                conn.close()
-                return jsonify({"error": f"Failed to provision patient account: {str(reg_err)}"}), 500
-        else:
-            conn.close()
-            # Do NOT auto-provision admin or doctor accounts
-            return jsonify({
-                "error": f"No authorized {portal_requested or 'staff'} profile found for {f_email or f_uid}. Please contact system administrator."
-            }), 404
-
-    # Check Account Active Status
-    if not user["is_active"]:
-        conn.close()
-        return jsonify({"error": "This account has been deactivated. Please contact an administrator."}), 403
-
-    user_role = user["role"].lower()
-
-    # Validate portal match: Prevent cross-portal login (HTTP 403)
-    if portal_requested and portal_requested != user_role:
-        conn.close()
-        return jsonify({
-            "error": f"Access Denied: This account is credentialed as a {user_role.capitalize()}. Please sign in through the designated {user_role.capitalize()} portal."
-        }), 403
-
-    # Ensure firebase_uid is linked in users table
-    if f_uid and user.get("firebase_uid") != f_uid:
-        try:
-            cursor.execute("UPDATE users SET firebase_uid = ? WHERE id = ?", (f_uid, user["id"]))
-            conn.commit()
-        except Exception as link_err:
-            print(f"[AUTH] Note on firebase_uid linking: {link_err}")
-
-    # Generate session token for backwards compatibility
-    token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(hours=24)
-    expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
-
-    cursor.execute("""
-        INSERT INTO user_tokens (token, user_id, expires_at)
-        VALUES (?, ?, ?)
-    """, (token, user["id"], expires_str))
-    conn.commit()
-    conn.close()
-
-    user_payload = {
-        "id": user["id"],
-        "name": user["name"],
-        "email": user["email"],
-        "role": user_role,
-        "doctor_id": user["doctor_id"] if user_role == "doctor" else None,
-        "patient_id": user["patient_id"] if user_role == "patient" else None,
-        "firebase_uid": f_uid,
-        "avatar": user["name"][:2].upper() if user.get("name") else "HP"
-    }
-
-    log_activity(
-        f"{user_role.upper()}_FIREBASE_LOGIN",
-        f"{user_role.capitalize()} {user['name']} authenticated via Firebase Auth",
-        user_role.capitalize(),
-        user["id"],
-        user["name"],
-        user_role.capitalize()
-    )
-
-    resp = make_response(jsonify({
-        "message": f"{user_role.capitalize()} Firebase authentication successful",
-        "token": token,
-        "idToken": id_token_str,
-        "role": user_role,
-        "user": user_payload,
-        "expires_at": expires_str
-    }))
-
-    resp.set_cookie(
-        "healthpulse_token",
-        token,
-        httponly=True,
-        samesite="Lax",
-        max_age=86400
-    )
-    return resp
-
-
-@app.route("/api/auth/account-link", methods=["POST"])
+@app.route("/api/auth/change-password", methods=["POST"])
 @require_auth
-def auth_account_link(current_user):
+def auth_change_password(current_user):
     """
-    Links the currently authenticated database user with a Firebase UID.
+    Allows any authenticated user (admin, doctor, patient) to update their password.
+    Verifies current password with Werkzeug check_password_hash,
+    generates secure pbkdf2 hash with generate_password_hash,
+    and updates the database.
     """
     data = request.get_json(silent=True) or {}
-    id_token_str = (data.get("idToken") or "").strip()
-    explicit_uid = (data.get("firebase_uid") or "").strip()
+    current_password = (data.get("current_password") or "").strip()
+    new_password = (data.get("new_password") or "").strip()
 
-    uid_to_link = None
-    if id_token_str:
-        try:
-            claims = verify_firebase_id_token(id_token_str)
-            uid_to_link = claims.get("uid")
-        except Exception as e:
-            return jsonify({"error": f"Invalid Firebase ID token: {str(e)}"}), 400
-    elif explicit_uid:
-        uid_to_link = explicit_uid
+    if not current_password or not new_password:
+        return jsonify({"error": "Both current password and new password are required."}), 400
 
-    if not uid_to_link:
-        return jsonify({"error": "idToken or firebase_uid is required."}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters in length."}), 400
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Check if another user already has this firebase_uid
-    cursor.execute("SELECT id, email, role FROM users WHERE firebase_uid = ? AND id != ?", (uid_to_link, current_user["id"]))
-    existing = cursor.fetchone()
-    if existing:
-        conn.close()
-        return jsonify({"error": f"This Firebase account is already linked to another user ({existing['email']})."}), 409
+    cursor.execute("SELECT id, password_hash, role, email FROM users WHERE id = ?", (current_user["id"],))
+    user_row = cursor.fetchone()
 
-    cursor.execute("UPDATE users SET firebase_uid = ? WHERE id = ?", (uid_to_link, current_user["id"]))
+    if not user_row:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    stored_hash = user_row["password_hash"]
+    is_valid = False
+    if stored_hash.startswith("pbkdf2:sha256:") or stored_hash.startswith("scrypt:"):
+        is_valid = check_password_hash(stored_hash, current_password)
+    else:
+        is_valid = (stored_hash == current_password)
+
+    if not is_valid:
+        conn.close()
+        return jsonify({"error": "Current password provided is incorrect."}), 400
+
+    new_hash = generate_password_hash(new_password)
+    cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user["id"]))
+
+    if current_user["role"] == "doctor":
+        cursor.execute("UPDATE doctors SET password = ? WHERE user_id = ? OR LOWER(email) = LOWER(?)", (new_hash, current_user["id"], current_user["email"]))
+    elif current_user["role"] == "patient":
+        cursor.execute("UPDATE patients SET password = ? WHERE user_id = ? OR LOWER(email) = LOWER(?)", (new_hash, current_user["id"], current_user["email"]))
+
     conn.commit()
     conn.close()
 
     log_activity(
-        "ACCOUNT_LINKED",
-        f"User {current_user['email']} linked with Firebase UID {uid_to_link}",
+        "PASSWORD_CHANGED",
+        f"User {current_user['email']} changed password successfully",
         current_user["role"].capitalize(),
         current_user["id"],
         current_user["name"],
         current_user["role"].capitalize()
     )
 
-    return jsonify({
-        "message": "Account successfully linked with Firebase authentication.",
-        "user_id": current_user["id"],
-        "firebase_uid": uid_to_link
-    })
+    return jsonify({"message": "Password changed successfully."})
 
 
 @app.route("/api/auth/logout", methods=["POST"])
