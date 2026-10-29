@@ -297,15 +297,22 @@ def get_db_connection():
             )
         pool = get_postgres_pool()
         if pool is not None:
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     raw_conn = pool.getconn()
                     if raw_conn.closed != 0:
                         pool.putconn(raw_conn, close=True)
                         continue
+                    # Ping connection to ensure remote SSL connection hasn't been closed by cloud provider
+                    try:
+                        with raw_conn.cursor() as test_cur:
+                            test_cur.execute("SELECT 1;")
+                    except Exception:
+                        pool.putconn(raw_conn, close=True)
+                        continue
                     return PostgresConnectionWrapper(raw_conn, pool=pool)
                 except Exception:
-                    if attempt == 1:
+                    if attempt == 2:
                         break
         try:
             raw_conn = psycopg2.connect(DATABASE_URL)

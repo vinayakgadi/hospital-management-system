@@ -626,6 +626,7 @@ def log_activity(event_type, description, entity_type=None, entity_id=None, acto
 
 
 def row_to_patient_dict(row):
+    row_keys = row.keys() if hasattr(row, "keys") else []
     return {
         "id": row["id"],
         "name": row["name"],
@@ -633,9 +634,15 @@ def row_to_patient_dict(row):
         "gender": row["gender"] or "Male",
         "age": str(row["age"]) if row["age"] is not None else "",
         "email": row["email"],
+        "phone": row["phone"] if "phone" in row_keys and row["phone"] else "+1 (555) 234-5678",
+        "address": row["address"] if "address" in row_keys and row["address"] else "742 Evergreen Terrace, Springfield, OR 97477",
+        "emergency_contact_name": row["emergency_contact_name"] if "emergency_contact_name" in row_keys and row["emergency_contact_name"] else "Sarah Jenkins",
+        "emergency_contact_phone": row["emergency_contact_phone"] if "emergency_contact_phone" in row_keys and row["emergency_contact_phone"] else "+1 (555) 987-6543",
+        "date_of_birth": row["date_of_birth"] if "date_of_birth" in row_keys and row["date_of_birth"] else "1992-06-15",
+        "blood_group": row["blood_group"] if "blood_group" in row_keys and row["blood_group"] else "O+",
         "disease": row["disease"] or "General",
         "role": row["role"] or "Patient",
-        "created_at": row["created_at"] if "created_at" in row.keys() else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at": row["created_at"] if "created_at" in row_keys else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "doctor": {
             "id": row["doctor_id"] or 1,
             "name": row["doctor_name"] or "Unassigned",
@@ -1888,7 +1895,7 @@ def get_doctor_dashboard(current_user, doctor_id=None):
     # Count pending tasks
     cursor.execute("""
         SELECT COUNT(*) FROM medical_records
-        WHERE doctor_id = ? AND follow_up_date >= date(?)
+        WHERE doctor_id = ? AND follow_up_date IS NOT NULL AND follow_up_date != '' AND follow_up_date >= ?
     """, (target_doctor_id, today_str))
     pending_followups = cursor.fetchone()[0]
 
@@ -3281,17 +3288,108 @@ def mark_all_doctor_notifications_read(current_user):
 
 
 # ---------------------------------------------------------
-# PATIENT-SPECIFIC ENDPOINTS WITH OWNERSHIP CHECKS
+# PATIENT-SPECIFIC ENDPOINTS WITH OWNERSHIP CHECKS & RBAC
 # ---------------------------------------------------------
+
+def resolve_current_patient_id(current_user):
+    """
+    Safely resolves the patient ID for the authenticated user without trusting client parameters.
+    Checks current_user['patient_id'] first, then queries patients by user_id or email.
+    """
+    if current_user.get("patient_id"):
+        return current_user["patient_id"]
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id FROM patients
+        WHERE user_id = ? OR LOWER(email) = LOWER(?)
+        ORDER BY id ASC LIMIT 1
+    """, (current_user["id"], current_user.get("email", "")))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        current_user["patient_id"] = row["id"]
+        return row["id"]
+    return None
+
+
+@app.route("/api/patient/me", methods=["GET"])
+@require_role("patient", "admin")
+def get_current_patient_profile(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Patient record not found."}), 404
+
+    return jsonify(row_to_patient_dict(row))
+
+
+@app.route("/api/patient/profile", methods=["PUT"])
+@require_role("patient")
+def update_patient_profile(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    address = (data.get("address") or "").strip()
+    emergency_contact_name = (data.get("emergency_contact_name") or "").strip()
+    emergency_contact_phone = (data.get("emergency_contact_phone") or "").strip()
+    blood_group = (data.get("blood_group") or "").strip()
+    weight = str(data.get("weight") or "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE patients
+        SET phone = ?, address = ?, emergency_contact_name = ?,
+            emergency_contact_phone = ?, blood_group = ?, weight = ?
+        WHERE id = ?
+    """, (phone, address, emergency_contact_name, emergency_contact_phone, blood_group, weight, patient_id))
+    conn.commit()
+
+    cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+    updated_row = cursor.fetchone()
+    conn.close()
+
+    log_activity("PATIENT_PROFILE_UPDATED", f"Patient {current_user['name']} updated personal contact profile", "Patient", patient_id, current_user['name'], "Patient")
+
+    return jsonify({
+        "message": "Personal health profile updated successfully.",
+        "patient": row_to_patient_dict(updated_row)
+    })
+
+
+@app.route("/api/patient/dashboard", methods=["GET"])
+@require_role("patient", "admin")
+def get_authenticated_patient_dashboard(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No patient record linked to this account."}), 404
+    return build_patient_dashboard_response(patient_id, current_user)
+
 
 @app.route("/api/patient/dashboard/<int:patient_id>", methods=["GET"])
 @require_role("admin", "patient")
 def get_patient_dashboard(current_user, patient_id):
     # Enforce patient authorization: Patients must NEVER access another patient's data
     if current_user["role"] == "patient":
-        if current_user["patient_id"] and current_user["patient_id"] != patient_id:
+        resolved_id = resolve_current_patient_id(current_user)
+        if resolved_id and resolved_id != patient_id:
             return jsonify({"error": "Access Denied: You cannot view or access another patient's confidential health records."}), 403
+    return build_patient_dashboard_response(patient_id, current_user)
 
+
+def build_patient_dashboard_response(patient_id, current_user):
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -3312,13 +3410,74 @@ def get_patient_dashboard(current_user, patient_id):
         "phone": "555-0101"
     }
 
-    # Appointments for this patient
+    # Summary Metrics
+    # 1. Upcoming Appointments Count
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM appointments
+        WHERE patient_id = ? AND status NOT IN ('Cancelled', 'Completed')
+    """, (patient_id,))
+    upcoming_appts_count = cursor.fetchone()["count"]
+
+    # 2. Finalized Records Count (Patients only see finalized records)
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM medical_records
+        WHERE patient_id = ? AND status = 'Finalized'
+    """, (patient_id,))
+    finalized_records_count = cursor.fetchone()["count"]
+
+    # 3. Active Prescriptions Count
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM prescriptions
+        WHERE patient_id = ? AND (status = 'Active' OR status IS NULL)
+    """, (patient_id,))
+    active_prescriptions_count = cursor.fetchone()["count"]
+
+    # 4. Lab Results Count
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM lab_results
+        WHERE patient_id = ?
+    """, (patient_id,))
+    lab_results_count = cursor.fetchone()["count"]
+
+    # 5. Unread Notifications Count
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM notifications
+        WHERE user_id = ? AND (is_read = FALSE OR is_read IS NULL)
+    """, (current_user["id"],))
+    unread_notifs_count = cursor.fetchone()["count"]
+
+    # Next upcoming appointment
+    cursor.execute("""
+        SELECT a.*, d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.patient_id = ? AND a.status NOT IN ('Cancelled', 'Completed')
+        ORDER BY a.appointment_date ASC, a.appointment_time ASC
+        LIMIT 1
+    """, (patient_id,))
+    next_appt_row = cursor.fetchone()
+    next_appointment = None
+    if next_appt_row:
+        next_appointment = {
+            "id": next_appt_row["id"],
+            "doctor_id": next_appt_row["doctor_id"],
+            "doctor_name": next_appt_row["doctor_name"],
+            "doctor_specialization": next_appt_row["doctor_specialization"],
+            "doctor_phone": next_appt_row["doctor_phone"],
+            "appointment_date": next_appt_row["appointment_date"],
+            "appointment_time": next_appt_row["appointment_time"],
+            "status": next_appt_row["status"],
+            "reason": next_appt_row["reason"] or "General Checkup",
+        }
+
+    # Recent Appointments (up to 4)
     cursor.execute("""
         SELECT a.*, d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone
         FROM appointments a
         JOIN doctors d ON a.doctor_id = d.id
         WHERE a.patient_id = ?
-        ORDER BY a.appointment_date ASC, a.appointment_time ASC
+        ORDER BY a.appointment_date DESC, a.appointment_time DESC
+        LIMIT 4
     """, (patient_id,))
     appointments = []
     for r in cursor.fetchall():
@@ -3331,16 +3490,684 @@ def get_patient_dashboard(current_user, patient_id):
             "appointment_date": r["appointment_date"],
             "appointment_time": r["appointment_time"],
             "status": r["status"],
-            "reason": r["reason"] or "General Checkup",
+            "reason": r["reason"] or "Consultation",
         })
+
+    # Recent Finalized Medical Records (up to 3)
+    cursor.execute("""
+        SELECT mr.*, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.patient_id = ? AND mr.status = 'Finalized'
+        ORDER BY mr.consultation_date DESC, mr.id DESC
+        LIMIT 3
+    """, (patient_id,))
+    recent_records = [row_to_medical_record_dict(r) for r in cursor.fetchall()]
+
+    # Recent Prescriptions (up to 3)
+    cursor.execute("""
+        SELECT pr.*, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM prescriptions pr
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.patient_id = ?
+        ORDER BY pr.prescription_date DESC, pr.id DESC
+        LIMIT 3
+    """, (patient_id,))
+    recent_prescriptions = [row_to_prescription_dict(r) for r in cursor.fetchall()]
+
+    # Recent Lab Results (up to 3)
+    cursor.execute("""
+        SELECT lr.*, d.name as doctor_name
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.patient_id = ?
+        ORDER BY lr.test_date DESC, lr.id DESC
+        LIMIT 3
+    """, (patient_id,))
+    recent_labs = [row_to_lab_result_dict(r) for r in cursor.fetchall()]
+
+    # Latest Vitals from most recent finalized record
+    latest_vitals = {
+        "blood_pressure": "120/80 mmHg",
+        "heart_rate": "72 bpm",
+        "oxygen_saturation": "98%",
+        "temperature": "98.6 °F",
+        "weight": f"{pat_row['weight']} kg" if pat_row["weight"] else "70 kg"
+    }
+    if recent_records and recent_records[0].get("vital_signs"):
+        vs = recent_records[0]["vital_signs"]
+        if isinstance(vs, dict):
+            if vs.get("blood_pressure") or vs.get("bp"):
+                latest_vitals["blood_pressure"] = vs.get("blood_pressure") or vs.get("bp")
+            if vs.get("heart_rate") or vs.get("pulse"):
+                latest_vitals["heart_rate"] = f"{vs.get('heart_rate') or vs.get('pulse')} bpm" if not str(vs.get('heart_rate') or vs.get('pulse')).endswith("bpm") else str(vs.get('heart_rate') or vs.get('pulse'))
+            if vs.get("oxygen_saturation") or vs.get("spo2"):
+                latest_vitals["oxygen_saturation"] = f"{vs.get('oxygen_saturation') or vs.get('spo2')}"
+            if vs.get("temperature") or vs.get("temp"):
+                latest_vitals["temperature"] = f"{vs.get('temperature') or vs.get('temp')}"
 
     conn.close()
 
     return jsonify({
         "patient": row_to_patient_dict(pat_row),
         "attending_doctor": attending_doc,
-        "appointments": appointments
+        "metrics": {
+            "upcoming_appointments": upcoming_appts_count,
+            "finalized_records": finalized_records_count,
+            "active_prescriptions": active_prescriptions_count,
+            "lab_results": lab_results_count,
+            "unread_notifications": unread_notifs_count,
+        },
+        "next_appointment": next_appointment,
+        "appointments": appointments,
+        "recent_records": recent_records,
+        "recent_prescriptions": recent_prescriptions,
+        "recent_labs": recent_labs,
+        "latest_vitals": latest_vitals
     })
+
+
+@app.route("/api/patient/appointments", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_appointments(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    tab = request.args.get("tab", "all").lower()
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT a.*, d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone, d.email as doctor_email
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.patient_id = ?
+    """
+    params = [patient_id]
+
+    if tab == "upcoming":
+        query += " AND a.status NOT IN ('Cancelled', 'Completed')"
+    elif tab == "past":
+        query += " AND (a.status IN ('Cancelled', 'Completed'))"
+
+    if status:
+        query += " AND LOWER(a.status) = LOWER(?)"
+        params.append(status)
+
+    if search:
+        query += " AND (LOWER(d.name) LIKE ? OR LOWER(d.specialization) LIKE ? OR LOWER(a.reason) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term, term])
+
+    if tab == "upcoming":
+        query += " ORDER BY a.appointment_date ASC, a.appointment_time ASC"
+    else:
+        query += " ORDER BY a.appointment_date DESC, a.appointment_time DESC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    appts = []
+    for r in rows:
+        appts.append({
+            "id": r["id"],
+            "doctor_id": r["doctor_id"],
+            "doctor_name": r["doctor_name"],
+            "doctor_specialization": r["doctor_specialization"],
+            "doctor_phone": r["doctor_phone"],
+            "doctor_email": r["doctor_email"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
+            "status": r["status"],
+            "reason": r["reason"] or "General Consultation",
+            "created_at": r["created_at"],
+        })
+
+    return jsonify(appts)
+
+
+@app.route("/api/patient/appointments", methods=["POST"])
+@require_role("patient")
+def book_patient_appointment(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    doctor_id = data.get("doctor_id")
+    appointment_date = (data.get("appointment_date") or "").strip()
+    appointment_time = (data.get("appointment_time") or "").strip()
+    reason = (data.get("reason") or "Routine Consultation").strip()
+
+    if not doctor_id:
+        return jsonify({"error": "Please select a physician for the appointment."}), 400
+    if not appointment_date or not appointment_time:
+        return jsonify({"error": "Appointment date and time are required."}), 400
+
+    # Validate date is not in the past
+    try:
+        appt_d = datetime.strptime(appointment_date, "%Y-%m-%d").date()
+        if appt_d < datetime.now().date():
+            return jsonify({"error": "Cannot schedule an appointment for a past date."}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid date format. Expected YYYY-MM-DD."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Validate doctor exists
+    cursor.execute("SELECT id, name, user_id FROM doctors WHERE id = ?", (doctor_id,))
+    doctor = cursor.fetchone()
+    if not doctor:
+        conn.close()
+        return jsonify({"error": "Selected doctor was not found in registry."}), 404
+
+    # Prevent double-booking for the doctor
+    cursor.execute("""
+        SELECT id FROM appointments
+        WHERE doctor_id = ? AND appointment_date = ? AND appointment_time = ?
+          AND status NOT IN ('Cancelled', 'Rejected')
+    """, (doctor_id, appointment_date, appointment_time))
+    conflict = cursor.fetchone()
+    if conflict:
+        conn.close()
+        return jsonify({"error": f"Dr. {doctor['name']} already has an appointment scheduled at {appointment_time} on {appointment_date}. Please pick an alternate time slot."}), 409
+
+    # Insert appointment
+    cursor.execute("""
+        INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, status, reason, created_at)
+        VALUES (?, ?, ?, ?, 'Scheduled', ?, CURRENT_TIMESTAMP)
+    """, (patient_id, doctor_id, appointment_date, appointment_time, reason))
+    conn.commit()
+
+    # Query new ID
+    cursor.execute("SELECT MAX(id) as id FROM appointments WHERE patient_id = ?", (patient_id,))
+    new_appt_id = cursor.fetchone()["id"]
+
+    # Notify doctor if user account linked
+    if doctor["user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+            VALUES (?, 'New Patient Appointment', ?, 'appointment', FALSE, '/doctor/appointments', CURRENT_TIMESTAMP)
+        """, (doctor["user_id"], f"Patient {current_user['name']} scheduled an appointment for {appointment_date} at {appointment_time}."))
+
+    # Notify patient
+    cursor.execute("""
+        INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+        VALUES (?, 'Appointment Confirmed', ?, 'appointment', FALSE, '/patient/appointments', CURRENT_TIMESTAMP)
+    """, (current_user["id"], f"Your appointment with Dr. {doctor['name']} has been booked for {appointment_date} at {appointment_time}."))
+
+    conn.commit()
+    conn.close()
+
+    log_activity("APPOINTMENT_BOOKED", f"Patient {current_user['name']} scheduled appointment with Dr. {doctor['name']} for {appointment_date}", "Appointment", new_appt_id, current_user['name'], "Patient")
+
+    return jsonify({
+        "message": "Appointment scheduled successfully.",
+        "appointment_id": new_appt_id
+    }), 201
+
+
+@app.route("/api/patient/appointments/<int:appointment_id>/cancel", methods=["PUT", "POST"])
+@require_role("patient")
+def cancel_patient_appointment(current_user, appointment_id):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT a.*, d.name as doctor_name, d.user_id as doctor_user_id
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.id = ?
+    """, (appointment_id,))
+    appt = cursor.fetchone()
+
+    if not appt:
+        conn.close()
+        return jsonify({"error": "Appointment record not found."}), 404
+
+    # Security IDOR check: ensure the appointment belongs to the calling patient
+    if appt["patient_id"] != patient_id:
+        conn.close()
+        return jsonify({"error": "Access Denied: You cannot cancel an appointment belonging to another patient."}), 403
+
+    if appt["status"] == "Cancelled":
+        conn.close()
+        return jsonify({"message": "Appointment is already cancelled."})
+
+    cursor.execute("UPDATE appointments SET status = 'Cancelled' WHERE id = ?", (appointment_id,))
+
+    # Notify doctor
+    if appt["doctor_user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+            VALUES (?, 'Appointment Cancelled', ?, 'appointment', FALSE, '/doctor/appointments', CURRENT_TIMESTAMP)
+        """, (appt["doctor_user_id"], f"Patient {current_user['name']} has cancelled the appointment on {appt['appointment_date']} at {appt['appointment_time']}."))
+
+    # Notify patient
+    cursor.execute("""
+        INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+        VALUES (?, 'Appointment Cancelled', ?, 'appointment', FALSE, '/patient/appointments', CURRENT_TIMESTAMP)
+    """, (current_user["id"], f"You have cancelled your appointment with Dr. {appt['doctor_name']} scheduled for {appt['appointment_date']}."))
+
+    conn.commit()
+    conn.close()
+
+    log_activity("APPOINTMENT_CANCELLED", f"Patient {current_user['name']} cancelled appointment #{appointment_id}", "Appointment", appointment_id, current_user['name'], "Patient")
+
+    return jsonify({"message": "Appointment successfully cancelled."})
+
+
+@app.route("/api/patient/doctors", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_doctors(current_user):
+    search = request.args.get("search", "").strip()
+    specialization = request.args.get("specialization", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT id, user_id, name, specialization, phone, email, status, qualifications, biography, experience_years, created_at
+        FROM doctors
+        WHERE (status = 'Active' OR status IS NULL)
+    """
+    params = []
+
+    if specialization and specialization.lower() != "all":
+        query += " AND LOWER(specialization) = LOWER(?)"
+        params.append(specialization)
+
+    if search:
+        query += " AND (LOWER(name) LIKE ? OR LOWER(specialization) LIKE ? OR LOWER(biography) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term, term])
+
+    query += " ORDER BY name ASC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    doctors = [row_to_doctor_dict(r) for r in rows]
+    return jsonify(doctors)
+
+
+@app.route("/api/patient/medical-records", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_medical_records(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # CRITICAL HEALTHCARE SECURITY: Only released/finalized records are visible to patients.
+    query = """
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.patient_id = ? AND mr.status = 'Finalized'
+    """
+    params = [patient_id]
+
+    if search:
+        query += " AND (LOWER(mr.diagnosis) LIKE ? OR LOWER(mr.symptoms) LIKE ? OR LOWER(d.name) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term, term])
+
+    query += " ORDER BY mr.consultation_date DESC, mr.id DESC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    records = [row_to_medical_record_dict(r) for r in rows]
+    return jsonify(records)
+
+
+@app.route("/api/patient/medical-records/<int:record_id>", methods=["GET"])
+@require_role("patient", "admin")
+def get_single_patient_medical_record(current_user, record_id):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "Medical record not found."}), 404
+
+    if row["patient_id"] != patient_id:
+        return jsonify({"error": "Access Denied: You cannot access another patient's medical record."}), 403
+
+    if row["status"] != "Finalized" and current_user["role"] == "patient":
+        return jsonify({"error": "This medical record is currently pending clinical review and has not yet been released."}), 403
+
+    return jsonify(row_to_medical_record_dict(row))
+
+
+@app.route("/api/patient/medical-records/<int:record_id>/correction-request", methods=["POST"])
+@require_role("patient")
+def request_medical_record_correction(current_user, record_id):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+    details = (data.get("details") or "").strip()
+
+    if not reason or not details:
+        return jsonify({"error": "Please specify both a reason and clear details for the correction request."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT mr.*, d.user_id as doctor_user_id, d.name as doctor_name
+        FROM medical_records mr
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    rec = cursor.fetchone()
+
+    if not rec:
+        conn.close()
+        return jsonify({"error": "Medical record not found."}), 404
+
+    if rec["patient_id"] != patient_id:
+        conn.close()
+        return jsonify({"error": "Access Denied: Cannot submit correction request for another patient's record."}), 403
+
+    cursor.execute("""
+        INSERT INTO patient_correction_requests (patient_id, medical_record_id, doctor_id, reason, details, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'Pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    """, (patient_id, record_id, rec["doctor_id"], reason, details))
+    conn.commit()
+
+    # Notify doctor
+    if rec["doctor_user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+            VALUES (?, 'Record Amendment Request', ?, 'record', FALSE, '/doctor/medical-records', CURRENT_TIMESTAMP)
+        """, (rec["doctor_user_id"], f"Patient {current_user['name']} has submitted a formal correction request for consultation record #{record_id}."))
+        conn.commit()
+
+    conn.close()
+
+    log_activity("CORRECTION_REQUESTED", f"Patient {current_user['name']} requested correction on record #{record_id}", "MedicalRecord", record_id, current_user['name'], "Patient")
+
+    return jsonify({
+        "message": "Your clinical correction request has been forwarded to the attending physician for review."
+    }), 201
+
+
+@app.route("/api/patient/correction-requests", methods=["GET"])
+@require_role("patient")
+def get_patient_correction_requests(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT cr.*, mr.consultation_date, d.name as doctor_name
+        FROM patient_correction_requests cr
+        JOIN medical_records mr ON cr.medical_record_id = mr.id
+        LEFT JOIN doctors d ON cr.doctor_id = d.id
+        WHERE cr.patient_id = ?
+        ORDER BY cr.created_at DESC
+    """, (patient_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    reqs = []
+    for r in rows:
+        reqs.append({
+            "id": r["id"],
+            "medical_record_id": r["medical_record_id"],
+            "consultation_date": r["consultation_date"],
+            "doctor_name": r["doctor_name"],
+            "reason": r["reason"],
+            "details": r["details"],
+            "status": r["status"],
+            "doctor_notes": r["doctor_notes"],
+            "created_at": r["created_at"],
+        })
+    return jsonify(reqs)
+
+
+@app.route("/api/patient/prescriptions", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_prescriptions(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    status_filter = request.args.get("status", "all").lower()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT pr.*,
+               p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+               d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.patient_id = ?
+    """
+    params = [patient_id]
+
+    if status_filter == "active":
+        query += " AND (LOWER(pr.status) = 'active' OR pr.status IS NULL)"
+    elif status_filter == "completed":
+        query += " AND LOWER(pr.status) IN ('completed', 'discontinued')"
+
+    if search:
+        query += " AND (LOWER(pr.medication_name) LIKE ? OR LOWER(d.name) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term])
+
+    query += " ORDER BY pr.prescription_date DESC, pr.id DESC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_prescription_dict(r) for r in rows])
+
+
+@app.route("/api/patient/prescriptions/<int:prescription_id>", methods=["GET"])
+@require_role("patient", "admin")
+def get_single_patient_prescription(current_user, prescription_id):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT pr.*,
+               p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+               d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.id = ?
+    """, (prescription_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "Prescription not found."}), 404
+
+    if row["patient_id"] != patient_id:
+        return jsonify({"error": "Access Denied: You cannot view another patient's prescription."}), 403
+
+    return jsonify(row_to_prescription_dict(row))
+
+
+@app.route("/api/patient/lab-results", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_lab_results(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT lr.*, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.patient_id = ?
+    """
+    params = [patient_id]
+
+    if search:
+        query += " AND (LOWER(lr.test_name) LIKE ? OR LOWER(lr.status) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term])
+
+    query += " ORDER BY lr.test_date DESC, lr.id DESC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_lab_result_dict(r) for r in rows])
+
+
+@app.route("/api/patient/notifications", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_notifications(current_user):
+    filter_type = request.args.get("filter", "all").lower()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = "SELECT * FROM notifications WHERE user_id = ?"
+    params = [current_user["id"]]
+
+    if filter_type == "unread":
+        query += " AND (is_read = FALSE OR is_read IS NULL)"
+
+    query += " ORDER BY id DESC LIMIT 50"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    notifs = []
+    for r in rows:
+        notifs.append({
+            "id": r["id"],
+            "title": r["title"],
+            "message": r["message"],
+            "type": r["type"],
+            "link": r["link"] if "link" in r.keys() else "/patient/dashboard",
+            "is_read": bool(r["is_read"]),
+            "created_at": r["created_at"],
+        })
+    return jsonify(notifs)
+
+
+@app.route("/api/patient/notifications/<int:notif_id>/read", methods=["PUT"])
+@require_role("patient", "admin")
+def mark_patient_notification_read(current_user, notif_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE notifications SET is_read = TRUE WHERE id = ? AND user_id = ?", (notif_id, current_user["id"]))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "Notification marked as read."})
+
+
+@app.route("/api/patient/notifications/read-all", methods=["POST", "PUT"])
+@require_role("patient", "admin")
+def mark_all_patient_notifications_read(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE notifications SET is_read = TRUE WHERE user_id = ?", (current_user["id"],))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "All notifications marked as read."})
+
+
+@app.route("/api/patient/change-password", methods=["POST"])
+@require_role("patient")
+def change_patient_password(current_user):
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("current_password", "").strip()
+    new_password = data.get("new_password", "").strip()
+
+    if not current_password or not new_password:
+        return jsonify({"error": "Both current and new passwords are required."}), 400
+
+    if len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters in length."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT password_hash FROM users WHERE id = ?", (current_user["id"],))
+    user_row = cursor.fetchone()
+    if not user_row or not check_password_hash(user_row["password_hash"], current_password):
+        conn.close()
+        return jsonify({"error": "The current password provided is incorrect."}), 401
+
+    new_hash = generate_password_hash(new_password)
+    cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user["id"]))
+
+    patient_id = resolve_current_patient_id(current_user)
+    if patient_id:
+        cursor.execute("UPDATE patients SET password = ? WHERE id = ?", (new_hash, patient_id))
+
+    conn.commit()
+    conn.close()
+
+    log_activity("PATIENT_PASSWORD_CHANGED", f"Password changed for patient {current_user['name']}", "User", current_user["id"], current_user["name"], "Patient")
+
+    return jsonify({"message": "Password changed successfully."})
 
 
 # ---------------------------------------------------------

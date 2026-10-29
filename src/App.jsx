@@ -28,7 +28,16 @@ import DoctorSchedule from './pages/doctor/DoctorSchedule.jsx'
 import DoctorProfile from './pages/doctor/DoctorProfile.jsx'
 import DoctorNotifications from './pages/doctor/DoctorNotifications.jsx'
 import DoctorSettings from './pages/doctor/DoctorSettings.jsx'
+import PatientLayout from './components/patient/PatientLayout.jsx'
 import PatientDashboard from './pages/patient/PatientDashboard.jsx'
+import PatientAppointments from './pages/patient/PatientAppointments.jsx'
+import FindDoctor from './pages/patient/FindDoctor.jsx'
+import PatientMedicalRecords from './pages/patient/PatientMedicalRecords.jsx'
+import PatientPrescriptions from './pages/patient/PatientPrescriptions.jsx'
+import PatientLabResults from './pages/patient/PatientLabResults.jsx'
+import PatientNotifications from './pages/patient/PatientNotifications.jsx'
+import PatientProfile from './pages/patient/PatientProfile.jsx'
+import PatientSettings from './pages/patient/PatientSettings.jsx'
 import './App.css'
 
 function RootRedirect() {
@@ -146,15 +155,26 @@ export default function App() {
             <Route path="settings" element={<DoctorSettings />} />
           </Route>
 
-          {/* Patient Protected Route */}
+          {/* Patient Protected Routes with PatientLayout */}
           <Route
-            path="/patient/dashboard"
+            path="/patient"
             element={
               <ProtectedRoute allowedRoles={['patient']}>
-                <PatientDashboard />
+                <PatientLayout />
               </ProtectedRoute>
             }
-          />
+          >
+            <Route index element={<Navigate to="/patient/dashboard" replace />} />
+            <Route path="dashboard" element={<PatientDashboard />} />
+            <Route path="appointments" element={<PatientAppointments />} />
+            <Route path="doctors" element={<FindDoctor />} />
+            <Route path="medical-records" element={<PatientMedicalRecords />} />
+            <Route path="prescriptions" element={<PatientPrescriptions />} />
+            <Route path="lab-results" element={<PatientLabResults />} />
+            <Route path="notifications" element={<PatientNotifications />} />
+            <Route path="profile" element={<PatientProfile />} />
+            <Route path="settings" element={<PatientSettings />} />
+          </Route>
 
           {/* Catch-all Fallback */}
           <Route path="*" element={<Navigate to="/login" replace />} />
