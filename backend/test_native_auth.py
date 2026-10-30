@@ -144,7 +144,7 @@ def run_tests():
     print("\n[TEST 7] Deactivated Account Access Blocking...")
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE email = 'shravan@healthpulse.com'")
+    cursor.execute("SELECT id FROM users WHERE email IN ('shravan@healthpulse.com', 'shravan11@gamil.com')")
     shravan_user = cursor.fetchone()
     shravan_id = shravan_user["id"]
 

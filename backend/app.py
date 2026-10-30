@@ -960,7 +960,8 @@ def auth_login():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Look up user in central users table
+    # Look up user in central users table (with support for demo patient alias)
+    search_email = "shravan11@gamil.com" if email in ["shravan@healthpulse.com", "shravan"] else email
     cursor.execute("""
         SELECT u.id, u.name, u.email, u.password_hash, u.role, u.is_active,
                d.id as doctor_id, d.specialization as doctor_specialization,
@@ -969,7 +970,7 @@ def auth_login():
         LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
         LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
         WHERE LOWER(u.email) = ?
-    """, (email,))
+    """, (search_email,))
     user = cursor.fetchone()
 
     # Fallback check for legacy admin credentials
