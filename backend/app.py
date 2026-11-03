@@ -43,6 +43,10 @@ from database import (
     get_active_db_engine,
     test_database_connection
 )
+from firebase_auth import (
+    verify_firebase_id_token,
+    is_firebase_configured
+)
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patients.db")
 
@@ -797,8 +801,8 @@ init_db()
 
 def get_current_user():
     """
-    Extracts Bearer token or cookie, verifies against PostgreSQL user_tokens session table,
-    and returns the active user dict with doctor_id/patient_id.
+    Extracts Bearer token or cookie, verifies against PostgreSQL user_tokens session table
+    or Firebase ID token verification, and returns the active user dict with doctor_id/patient_id.
     Caches result in Flask request context (g.current_user) to avoid redundant DB queries.
     Sets g.auth_error if account is inactive or token invalid.
     """
@@ -818,8 +822,9 @@ def get_current_user():
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # 1. First check if token is an active session token in user_tokens
     cursor.execute("""
-        SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at,
+        SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.firebase_uid,
                t.token, t.expires_at,
                d.id as doctor_id, d.specialization as doctor_specialization,
                p.id as patient_id
@@ -831,22 +836,52 @@ def get_current_user():
     """, (token,))
     user_row = cursor.fetchone()
 
-    if not user_row:
-        conn.close()
-        return None
+    # Check token expiration if from user_tokens table
+    if user_row:
+        raw_exp = user_row.get("expires_at")
+        if raw_exp is not None:
+            if isinstance(raw_exp, datetime):
+                expires_at = raw_exp
+            else:
+                try:
+                    expires_at = datetime.strptime(str(raw_exp), "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    expires_at = datetime.utcnow() + timedelta(hours=1)
+            if expires_at < datetime.utcnow():
+                cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
+                conn.commit()
+                conn.close()
+                return None
 
-    # Check token expiration
-    raw_exp = user_row["expires_at"]
-    if isinstance(raw_exp, datetime):
-        expires_at = raw_exp
-    else:
-        try:
-            expires_at = datetime.strptime(str(raw_exp), "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            expires_at = datetime.utcnow() + timedelta(hours=1)
-    if expires_at < datetime.utcnow():
-        cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
-        conn.commit()
+    # 2. If not found in user_tokens, check if token is a Firebase ID token (or mock dev token)
+    if not user_row:
+        claims = verify_firebase_id_token(token)
+        if claims:
+            firebase_uid = claims.get("uid")
+            email = (claims.get("email") or "").lower()
+            search_email = "shravan11@gamil.com" if email in ["shravan@healthpulse.com", "shravan"] else email
+            cursor.execute("""
+                SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.firebase_uid,
+                       d.id as doctor_id, d.specialization as doctor_specialization,
+                       p.id as patient_id
+                FROM users u
+                LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+                LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+                WHERE (u.firebase_uid IS NOT NULL AND u.firebase_uid = ?) 
+                   OR (LOWER(u.email) = ?)
+            """, (firebase_uid, search_email))
+            user_row = cursor.fetchone()
+
+            if user_row:
+                # Auto-link firebase_uid if missing
+                if not user_row.get("firebase_uid") and firebase_uid:
+                    try:
+                        cursor.execute("UPDATE users SET firebase_uid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (firebase_uid, user_row["id"]))
+                        conn.commit()
+                    except Exception as link_err:
+                        print(f"[Firebase] Auto-linking notice: {link_err}")
+
+    if not user_row:
         conn.close()
         return None
 
@@ -868,6 +903,7 @@ def get_current_user():
         "doctor_id": user_row["doctor_id"],
         "doctor_specialization": user_row["doctor_specialization"],
         "patient_id": user_row["patient_id"],
+        "firebase_uid": user_row.get("firebase_uid"),
         "token": token
     }
     conn.close()
@@ -1075,6 +1111,241 @@ def auth_login():
     return resp
 
 
+@app.route("/api/auth/firebase-login", methods=["POST"])
+def auth_firebase_login():
+    """
+    Exchanges a Firebase ID token for a HealthPulse authenticated session.
+    Validates token, extracts UID and verified email, enforces strict RBAC
+    against PostgreSQL users table, prevents cross-portal access (403),
+    prevents unauthorized Admin/Doctor account auto-creation,
+    auto-provisions new patient accounts when appropriate,
+    and returns an authenticated user payload and session token.
+    """
+    data = request.get_json(silent=True) or {}
+    id_token = data.get("idToken")
+    portal_requested = (data.get("role") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+    provider = data.get("provider", "password")
+
+    if not id_token:
+        return jsonify({"error": "Firebase authentication ID token is required."}), 400
+
+    claims = verify_firebase_id_token(id_token)
+    if not claims:
+        return jsonify({
+            "error": "Firebase authentication failed: Invalid or expired token.",
+            "code": "INVALID_TOKEN"
+        }), 401
+
+    firebase_uid = claims.get("uid")
+    email = (claims.get("email") or "").strip().lower()
+    if not email and not firebase_uid:
+        return jsonify({"error": "Token did not contain valid identity claims."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Look up user in PostgreSQL users table (with support for demo patient alias)
+    search_email = "shravan11@gamil.com" if email in ["shravan@healthpulse.com", "shravan"] else email
+    cursor.execute("""
+        SELECT u.id, u.name, u.email, u.role, u.is_active, u.firebase_uid,
+               d.id as doctor_id, d.specialization as doctor_specialization,
+               p.id as patient_id
+        FROM users u
+        LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+        LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+        WHERE (u.firebase_uid IS NOT NULL AND u.firebase_uid = ?)
+           OR (LOWER(u.email) = ?)
+    """, (firebase_uid, search_email))
+    user = cursor.fetchone()
+
+    # Fallback check for doctors or patients not yet linked to users table
+    if not user:
+        cursor.execute("SELECT id, name, email, user_id FROM doctors WHERE LOWER(email) = ?", (search_email,))
+        doc_match = cursor.fetchone()
+        if doc_match and doc_match.get("user_id"):
+            cursor.execute("""
+                SELECT u.id, u.name, u.email, u.role, u.is_active, u.firebase_uid,
+                       d.id as doctor_id, d.specialization as doctor_specialization,
+                       p.id as patient_id
+                FROM users u
+                LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+                LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+                WHERE u.id = ?
+            """, (doc_match["user_id"],))
+            user = cursor.fetchone()
+
+    if not user:
+        cursor.execute("SELECT id, name, email, user_id FROM patients WHERE LOWER(email) = ?", (search_email,))
+        pat_match = cursor.fetchone()
+        if pat_match and pat_match.get("user_id"):
+            cursor.execute("""
+                SELECT u.id, u.name, u.email, u.role, u.is_active, u.firebase_uid,
+                       d.id as doctor_id, d.specialization as doctor_specialization,
+                       p.id as patient_id
+                FROM users u
+                LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+                LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+                WHERE u.id = ?
+            """, (pat_match["user_id"],))
+            user = cursor.fetchone()
+
+    # If user does NOT exist in the database:
+    if not user:
+        # STRICT SECURITY RULE:
+        # Admin and Doctor accounts MUST NEVER be auto-created via Firebase / Google login!
+        if portal_requested in ["admin", "doctor"]:
+            conn.close()
+            return jsonify({
+                "error": f"Access Denied: No {portal_requested} account exists for this email address. "
+                         f"Administrative and physician accounts must be provisioned by hospital administration.",
+                "code": "FORBIDDEN"
+            }), 403
+
+        # For Patient portal, auto-provision new patient profile
+        patient_name = name or claims.get("name") or (email.split("@")[0].title() if email else "Patient User")
+        age = str(data.get("age", "30")).strip()
+        weight = str(data.get("weight", "70")).strip()
+        gender = data.get("gender", "Male").strip()
+        disease = data.get("disease", "General Wellness").strip()
+
+        try:
+            cursor.execute("""
+                INSERT INTO users (name, email, password_hash, role, is_active, firebase_uid)
+                VALUES (?, ?, 'FIREBASE_MANAGED_AUTH', 'patient', ?, ?)
+            """, (patient_name, email, True, firebase_uid))
+            new_user_id = cursor.lastrowid
+
+            cursor.execute("""
+                INSERT INTO patients (
+                    user_id, name, weight, gender, age, email, password, disease,
+                    doctor_id, doctor_name, doctor_specialization, role
+                ) VALUES (?, ?, ?, ?, ?, ?, 'FIREBASE_MANAGED_AUTH', ?, 1, 'Dr. Satya Deep', 'Cardiology', 'Patient')
+            """, (new_user_id, patient_name, weight, gender, age, email, disease))
+            new_patient_id = cursor.lastrowid
+            conn.commit()
+
+            cursor.execute("""
+                SELECT u.id, u.name, u.email, u.role, u.is_active, u.firebase_uid,
+                       p.id as patient_id
+                FROM users u
+                LEFT JOIN patients p ON p.user_id = u.id
+                WHERE u.id = ?
+            """, (new_user_id,))
+            user = cursor.fetchone()
+            log_activity("PATIENT_REGISTERED", f"Patient {patient_name} registered via Firebase", "Patient", new_patient_id, patient_name, "Patient")
+        except Exception as prov_err:
+            conn.close()
+            print(f"[Firebase] User provisioning error: {prov_err}")
+            return jsonify({"error": "Failed to create patient account in hospital database."}), 500
+
+    # User exists: check status and role
+    if not user["is_active"]:
+        conn.close()
+        return jsonify({
+            "error": "This account has been deactivated. Please contact an administrator.",
+            "code": "ACCOUNT_DEACTIVATED"
+        }), 403
+
+    user_role = user["role"].lower()
+
+    # STRICT CROSS-PORTAL CHECK:
+    # If the user attempts to sign into Doctor portal with a Patient account, or Admin portal with Doctor account:
+    if portal_requested and portal_requested != user_role:
+        conn.close()
+        return jsonify({
+            "error": f"Access Denied: This account is credentialed as a {user_role.capitalize()}. "
+                     f"Please sign in through the designated {user_role.capitalize()} portal.",
+            "code": "FORBIDDEN"
+        }), 403
+
+    # Auto-link or update firebase_uid if not set
+    if not user.get("firebase_uid") or user.get("firebase_uid") != firebase_uid:
+        try:
+            cursor.execute("UPDATE users SET firebase_uid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (firebase_uid, user["id"]))
+            conn.commit()
+        except Exception as link_err:
+            print(f"[Firebase] Note linking firebase_uid: {link_err}")
+
+    # Generate session token in user_tokens table
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+    expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        INSERT INTO user_tokens (token, user_id, expires_at)
+        VALUES (?, ?, ?)
+    """, (token, user["id"], expires_str))
+    conn.commit()
+    conn.close()
+
+    user_payload = {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "role": user_role,
+        "doctor_id": user.get("doctor_id") if user_role == "doctor" else None,
+        "patient_id": user.get("patient_id") if user_role == "patient" else None,
+        "firebase_uid": firebase_uid,
+        "avatar": user["name"][:2].upper()
+    }
+
+    log_activity(
+        f"{user_role.upper()}_FIREBASE_LOGIN",
+        f"{user_role.capitalize()} {user['name']} authenticated via Firebase ({provider})",
+        user_role.capitalize(),
+        user["id"],
+        user["name"],
+        user_role.capitalize()
+    )
+
+    resp = make_response(jsonify({
+        "message": f"{user_role.capitalize()} authentication successful",
+        "token": token,
+        "idToken": id_token,
+        "role": user_role,
+        "user": user_payload,
+        "expires_at": expires_str
+    }))
+
+    resp.set_cookie(
+        "healthpulse_token",
+        token,
+        httponly=True,
+        samesite="Lax",
+        max_age=86400
+    )
+    return resp
+
+
+@app.route("/api/auth/link-firebase", methods=["POST"])
+@require_auth
+def auth_link_firebase(current_user):
+    """
+    Explicitly associates a Firebase UID with the currently authenticated PostgreSQL user.
+    """
+    data = request.get_json(silent=True) or {}
+    id_token = data.get("idToken")
+    if not id_token:
+        return jsonify({"error": "idToken is required to link Firebase account."}), 400
+
+    claims = verify_firebase_id_token(id_token)
+    if not claims:
+        return jsonify({"error": "Invalid or expired Firebase token."}), 401
+
+    firebase_uid = claims["uid"]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET firebase_uid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (firebase_uid, current_user["id"]))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "message": "Account successfully linked with Firebase identity.",
+        "firebase_uid": firebase_uid
+    })
+
+
 @app.route("/api/auth/change-password", methods=["POST"])
 @require_auth
 def auth_change_password(current_user):
@@ -1206,12 +1477,14 @@ def auth_register_patient():
         conn.close()
         return jsonify({"error": "An account with this email address already exists."}), 409
 
+    firebase_uid = data.get("firebase_uid") or None
+
     try:
         pw_hash = generate_password_hash(password)
         cursor.execute("""
-            INSERT INTO users (name, email, password_hash, role, is_active)
-            VALUES (?, ?, ?, 'patient', 1)
-        """, (name, email, pw_hash))
+            INSERT INTO users (name, email, password_hash, role, is_active, firebase_uid)
+            VALUES (?, ?, ?, 'patient', ?, ?)
+        """, (name, email, pw_hash, True, firebase_uid))
         new_user_id = cursor.lastrowid
 
         # Insert corresponding patient record linked with user_id
