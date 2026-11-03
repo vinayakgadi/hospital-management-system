@@ -21,7 +21,9 @@ import {
   Stethoscope,
   ShieldCheck,
   Sparkles,
+  XCircle,
 } from 'lucide-react'
+import { formatConsultationDate, formatDoctorName } from '../../utils/dateUtils.js'
 
 export default function PatientDashboard() {
   const { user } = useAuth()
@@ -213,52 +215,146 @@ export default function PatientDashboard() {
 
       {/* Next Appointment & Primary Care Doctor */}
       <div className="row g-4 mb-4">
-        {/* Next Appointment Banner */}
+        {/* Upcoming Consultation Banner */}
         <div className="col-lg-7">
-          <div className="card border-0 shadow-sm rounded-4 h-100 bg-white">
-            <div className="card-header bg-white border-bottom p-3.5 d-flex align-items-center justify-content-between">
-              <div className="d-flex align-items-center gap-2">
-                <div className="p-1.5 rounded-2 bg-primary bg-opacity-10 text-primary">
+          <div
+            className="card border-0 shadow-sm rounded-4 h-100 bg-white"
+            style={{ boxSizing: 'border-box', maxWidth: '100%', minWidth: 0, overflow: 'hidden' }}
+          >
+            <div
+              className="card-header bg-white border-bottom p-3.5 d-flex align-items-center justify-content-between flex-wrap gap-2"
+              style={{ boxSizing: 'border-box', minWidth: 0, maxWidth: '100%' }}
+            >
+              <div className="d-flex align-items-center gap-2" style={{ minWidth: 0 }}>
+                <div className="p-1.5 rounded-2 bg-primary bg-opacity-10 text-primary flex-shrink-0">
                   <Calendar size={18} />
                 </div>
-                <h6 className="fw-bold text-dark mb-0">Next Scheduled Consultation</h6>
+                <h6 className="fw-bold text-dark mb-0 text-truncate">Upcoming Consultation</h6>
               </div>
-              <Link to="/patient/appointments" className="small text-primary text-decoration-none fw-semibold">
+              <Link to="/patient/appointments" className="small text-primary text-decoration-none fw-semibold flex-shrink-0">
                 Manage All
               </Link>
             </div>
-            <div className="card-body p-4">
+            <div
+              className="card-body p-3.5 p-md-4 d-flex flex-column justify-content-center"
+              style={{ boxSizing: 'border-box', minWidth: 0, maxWidth: '100%' }}
+            >
               {nextAppt ? (
-                <div className="p-3.5 bg-light rounded-4 border">
-                  <div className="d-flex flex-wrap align-items-center justify-content-between gap-3 mb-3">
-                    <div>
-                      <span className="badge bg-primary-subtle text-primary fw-medium px-2.5 py-1 rounded-pill mb-2">
-                        {nextAppt.status}
-                      </span>
-                      <h5 className="fw-bold text-dark mb-1">{nextAppt.reason}</h5>
-                      <p className="text-muted small mb-0">With Dr. {nextAppt.doctor_name} ({nextAppt.doctor_specialization})</p>
-                    </div>
-                    <div className="text-lg-end">
-                      <div className="fs-6 fw-bold text-primary">{nextAppt.appointment_date}</div>
-                      <div className="small text-muted">{nextAppt.appointment_time}</div>
-                    </div>
-                  </div>
-                  <div className="pt-3 border-top d-flex align-items-center justify-content-between">
-                    <span className="small text-muted">
-                      Need to reschedule or cancel?
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => handleCancelAppointment(nextAppt.id)}
-                      disabled={cancellingId === nextAppt.id}
-                      className="btn btn-outline-danger btn-sm rounded-3 px-3"
+                <div
+                  className="p-3.5 p-md-4 bg-light rounded-4 border w-100"
+                  style={{
+                    boxSizing: 'border-box',
+                    maxWidth: '100%',
+                    minWidth: 0,
+                    overflow: 'hidden',
+                  }}
+                >
+                  <div
+                    className="d-flex flex-column flex-md-row align-items-stretch align-items-md-center justify-content-between gap-3 gap-lg-4 w-100"
+                    style={{
+                      boxSizing: 'border-box',
+                      minWidth: 0,
+                      maxWidth: '100%',
+                    }}
+                  >
+                    {/* Left: Appointment Details */}
+                    <div
+                      className="d-flex flex-column flex-grow-1"
+                      style={{
+                        minWidth: 0,
+                        maxWidth: '100%',
+                        boxSizing: 'border-box',
+                        overflowWrap: 'anywhere',
+                        wordBreak: 'break-word',
+                      }}
                     >
-                      {cancellingId === nextAppt.id ? 'Cancelling...' : 'Cancel Appointment'}
-                    </button>
+                      <div className="d-flex flex-wrap align-items-center gap-2 mb-2">
+                        <span className="badge bg-primary-subtle text-primary fw-medium px-2.5 py-1 rounded-pill">
+                          {nextAppt.status || 'Scheduled'}
+                        </span>
+                      </div>
+
+                      <h5
+                        className="fw-bold text-dark mb-1 text-break"
+                        style={{
+                          minWidth: 0,
+                          maxWidth: '100%',
+                          wordBreak: 'break-word',
+                          overflowWrap: 'anywhere',
+                        }}
+                      >
+                        {nextAppt.reason || 'General Medical Consultation'}
+                      </h5>
+
+                      <p
+                        className="text-muted small mb-0 text-break"
+                        style={{
+                          minWidth: 0,
+                          maxWidth: '100%',
+                          wordBreak: 'break-word',
+                          overflowWrap: 'anywhere',
+                        }}
+                      >
+                        With {formatDoctorName(nextAppt.doctor_name)}
+                        {nextAppt.doctor_specialization ? ` (${nextAppt.doctor_specialization})` : ''}
+                      </p>
+                    </div>
+
+                    {/* Right: Date/Time and Actions (desktop: right-aligned; mobile: full-width stacked) */}
+                    <div
+                      className="d-flex flex-column align-items-stretch align-items-md-end justify-content-center gap-2.5 flex-shrink-0 w-100 w-md-auto text-start text-md-end pt-3 pt-md-0 border-top border-md-0"
+                      style={{
+                        minWidth: 0,
+                        maxWidth: '100%',
+                        boxSizing: 'border-box',
+                      }}
+                    >
+                      {/* Date & Time */}
+                      <div
+                        className="d-flex flex-column align-items-start align-items-md-end"
+                        style={{ minWidth: 0, maxWidth: '100%' }}
+                      >
+                        <div
+                          className="fs-6 fw-bold text-primary text-break"
+                          style={{
+                            minWidth: 0,
+                            maxWidth: '100%',
+                            whiteSpace: 'normal',
+                            wordBreak: 'break-word',
+                            overflowWrap: 'anywhere',
+                          }}
+                        >
+                          {formatConsultationDate(nextAppt.appointment_date)}
+                        </div>
+                        {nextAppt.appointment_time && (
+                          <div className="small text-muted d-flex align-items-center gap-1.5 mt-0.5">
+                            <Clock size={13} className="text-secondary flex-shrink-0" />
+                            <span>{nextAppt.appointment_time}</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Cancel Action */}
+                      <div className="w-100 w-md-auto">
+                        <button
+                          type="button"
+                          onClick={() => handleCancelAppointment(nextAppt.id)}
+                          disabled={cancellingId === nextAppt.id}
+                          className="btn btn-outline-danger btn-sm rounded-3 px-3 py-1.5 w-100 w-md-auto d-inline-flex align-items-center justify-content-center gap-1.5"
+                          style={{ whiteSpace: 'nowrap', maxWidth: '100%' }}
+                        >
+                          <XCircle size={14} className="flex-shrink-0" />
+                          <span>{cancellingId === nextAppt.id ? 'Cancelling...' : 'Cancel Appointment'}</span>
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </div>
               ) : (
-                <div className="text-center py-4 text-muted">
+                <div
+                  className="text-center py-4 text-muted"
+                  style={{ minWidth: 0, maxWidth: '100%', boxSizing: 'border-box' }}
+                >
                   <Calendar size={36} className="text-muted opacity-50 mb-2" />
                   <p className="small mb-3">You have no upcoming appointments scheduled.</p>
                   <Link to="/patient/appointments" className="btn btn-primary btn-sm rounded-3 px-3">
@@ -408,8 +504,8 @@ export default function PatientDashboard() {
                       </div>
                       <p className="text-muted small mb-2 text-truncate">{r.treatment_plan || r.symptoms || 'General clinical review.'}</p>
                       <div className="d-flex align-items-center justify-content-between text-muted small" style={{ fontSize: '0.78rem' }}>
-                        <span>Dr. {r.doctor_name} ({r.doctor_specialization})</span>
-                        <span>{r.consultation_date}</span>
+                        <span>{formatDoctorName(r.doctor_name)} {r.doctor_specialization ? `(${r.doctor_specialization})` : ''}</span>
+                        <span>{formatConsultationDate(r.consultation_date)}</span>
                       </div>
                     </div>
                   ))}
@@ -448,7 +544,7 @@ export default function PatientDashboard() {
                         <span className="fw-medium">{p.dosage}</span> • {p.frequency} • {p.duration}
                       </div>
                       <div className="text-muted small" style={{ fontSize: '0.76rem' }}>
-                        Prescribed by Dr. {p.doctor_name} on {p.prescription_date}
+                        Prescribed by {formatDoctorName(p.doctor_name)} on {formatConsultationDate(p.prescription_date)}
                       </div>
                     </div>
                   ))}

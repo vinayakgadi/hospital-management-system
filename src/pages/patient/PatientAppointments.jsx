@@ -16,6 +16,7 @@ import {
   Mail,
   RefreshCw,
 } from 'lucide-react'
+import { formatConsultationDate, formatDoctorName } from '../../utils/dateUtils.js'
 
 export default function PatientAppointments() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -317,7 +318,7 @@ export default function PatientAppointments() {
                         <Stethoscope size={20} />
                       </div>
                       <div>
-                        <h6 className="fw-bold text-dark mb-0">Dr. {appt.doctor_name}</h6>
+                        <h6 className="fw-bold text-dark mb-0">{formatDoctorName(appt.doctor_name)}</h6>
                         <span className="text-muted small">{appt.doctor_specialization}</span>
                       </div>
                     </div>
@@ -325,22 +326,22 @@ export default function PatientAppointments() {
                   </div>
 
                   {/* Visit Details */}
-                  <div className="p-3 bg-light rounded-3 mb-3">
-                    <div className="fw-semibold text-dark small mb-1">{appt.reason || 'General Medical Consultation'}</div>
-                    <div className="d-flex flex-wrap align-items-center gap-3 text-secondary small" style={{ fontSize: '0.8rem' }}>
-                      <span className="d-flex align-items-center gap-1.5">
-                        <Calendar size={14} className="text-primary" />
-                        <span>{appt.appointment_date}</span>
+                  <div className="p-3 bg-light rounded-3 mb-3" style={{ minWidth: 0, maxWidth: '100%', boxSizing: 'border-box' }}>
+                    <div className="fw-semibold text-dark small mb-1 text-break">{appt.reason || 'General Medical Consultation'}</div>
+                    <div className="d-flex flex-wrap align-items-center gap-3 text-secondary small" style={{ fontSize: '0.8rem', minWidth: 0, maxWidth: '100%' }}>
+                      <span className="d-flex align-items-center gap-1.5 text-break">
+                        <Calendar size={14} className="text-primary flex-shrink-0" />
+                        <span>{formatConsultationDate(appt.appointment_date)}</span>
                       </span>
-                      <span className="d-flex align-items-center gap-1.5">
-                        <Clock size={14} className="text-primary" />
+                      <span className="d-flex align-items-center gap-1.5 flex-shrink-0">
+                        <Clock size={14} className="text-primary flex-shrink-0" />
                         <span>{appt.appointment_time}</span>
                       </span>
                     </div>
                   </div>
 
                   {/* Doctor Contact & Action Footer */}
-                  <div className="d-flex align-items-center justify-content-between pt-2 border-top">
+                  <div className="d-flex flex-wrap align-items-center justify-content-between gap-2 pt-2 border-top" style={{ minWidth: 0, maxWidth: '100%', boxSizing: 'border-box' }}>
                     <div className="d-flex align-items-center gap-3 text-muted small" style={{ fontSize: '0.78rem' }}>
                       {appt.doctor_phone && (
                         <span className="d-flex align-items-center gap-1">

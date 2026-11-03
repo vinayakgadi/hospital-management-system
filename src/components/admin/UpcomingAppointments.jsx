@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import axios from 'axios'
 import { API_BASE_URL } from '../../config.js'
 import { Calendar, Clock, User, Stethoscope, CheckCircle2, XCircle, Clock4, MoreHorizontal } from 'lucide-react'
+import { formatConsultationDate, formatDoctorName } from '../../utils/dateUtils.js'
 
 export default function UpcomingAppointments({ refreshTrigger, onScheduleNew }) {
   const [appointments, setAppointments] = useState([])
@@ -106,13 +107,13 @@ export default function UpcomingAppointments({ refreshTrigger, onScheduleNew }) 
                       </span>
                     </div>
                     <div className="d-flex flex-wrap align-items-center gap-3 text-muted small" style={{ fontSize: '0.78rem' }}>
-                      <span className="d-flex align-items-center gap-1">
-                        <Stethoscope size={13} className="text-primary" />
-                        <span>Dr. {app.doctor_name || 'Assigned Doctor'}</span>
+                      <span className="d-flex align-items-center gap-1 text-break">
+                        <Stethoscope size={13} className="text-primary flex-shrink-0" />
+                        <span>{formatDoctorName(app.doctor_name)}</span>
                       </span>
-                      <span className="d-flex align-items-center gap-1">
-                        <Clock size={13} className="text-secondary" />
-                        <span>{app.appointment_date} at {app.appointment_time}</span>
+                      <span className="d-flex align-items-center gap-1 text-break">
+                        <Clock size={13} className="text-secondary flex-shrink-0" />
+                        <span>{formatConsultationDate(app.appointment_date)} at {app.appointment_time}</span>
                       </span>
                     </div>
                   </div>
