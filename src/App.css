@@ -49,6 +49,23 @@
   box-shadow: 0 4px 12px rgba(2, 132, 199, 0.3);
 }
 
+/* Sidebar Doctor / User Profile Badge */
+.sidebar-profile-card {
+  background-color: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  transition: all 0.2s ease-in-out;
+}
+
+.sidebar-profile-card:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  border-color: rgba(56, 189, 248, 0.3);
+}
+
 /* Mobile Responsive Sidebar */
 @media (max-width: 991.98px) {
   .sidebar-nav {

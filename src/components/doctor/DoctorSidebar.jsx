@@ -58,28 +58,45 @@ export default function DoctorSidebar({ isOpen, onClose, unreadCount = 0 }) {
           borderRight: '1px solid rgba(255, 255, 255, 0.08)',
           zIndex: 1045,
           transition: 'transform 0.3s ease-in-out',
+          overflowX: 'hidden',
         }}
       >
         {/* Brand Header */}
         <div
-          className="d-flex align-items-center justify-content-between px-4 py-3"
-          style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.08)', height: '70px' }}
+          className="d-flex align-items-center justify-content-between px-4 py-3 flex-shrink-0"
+          style={{
+            borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+            minHeight: '70px',
+            height: '70px',
+            boxSizing: 'border-box',
+          }}
         >
           <div className="d-flex align-items-center gap-2">
             <div
-              className="p-2 rounded-3 text-white d-flex align-items-center justify-content-center"
+              className="rounded-3 text-white d-flex align-items-center justify-content-center flex-shrink-0"
               style={{
+                width: '38px',
+                height: '38px',
                 background: 'linear-gradient(135deg, #0284c7 0%, #06b6d4 100%)',
                 boxShadow: '0 4px 12px rgba(6, 182, 212, 0.3)',
               }}
             >
               <HeartPulse size={22} className="text-white" />
             </div>
-            <div>
+            <div style={{ minWidth: 0 }}>
               <span className="fw-bold fs-5 text-white tracking-wide d-block leading-tight">
                 Health<span style={{ color: '#38bdf8' }}>Pulse</span>
               </span>
-              <span className="badge bg-cyan-subtle text-info text-uppercase px-2 py-0" style={{ fontSize: '0.65rem' }}>
+              <span
+                className="badge text-uppercase px-2 py-0.5 fw-semibold"
+                style={{
+                  fontSize: '0.65rem',
+                  letterSpacing: '0.04em',
+                  backgroundColor: 'rgba(6, 182, 212, 0.15)',
+                  color: '#38bdf8',
+                  border: '1px solid rgba(56, 189, 248, 0.25)',
+                }}
+              >
                 Doctor Portal
               </span>
             </div>
@@ -94,42 +111,52 @@ export default function DoctorSidebar({ isOpen, onClose, unreadCount = 0 }) {
           </button>
         </div>
 
-        {/* Doctor Quick Badge */}
-        <div className="px-3 pt-3 pb-2">
-          <div
-            className="p-2.5 rounded-3 d-flex align-items-center gap-2.5"
-            style={{ backgroundColor: 'rgba(255, 255, 255, 0.04)', border: '1px solid rgba(255, 255, 255, 0.06)' }}
-          >
+        {/* Doctor Profile Card */}
+        <div className="px-3 pt-3 pb-2 flex-shrink-0">
+          <div className="sidebar-profile-card">
             <div
-              className="rounded-circle d-flex align-items-center justify-center font-monospace fw-bold text-white flex-shrink-0"
+              className="rounded-circle text-white flex-shrink-0 d-flex align-items-center justify-content-center"
               style={{
-                width: '36px',
-                height: '36px',
+                width: '38px',
+                height: '38px',
                 background: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)',
-                fontSize: '0.85rem',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
+                boxShadow: '0 2px 8px rgba(2, 132, 199, 0.35)',
               }}
             >
               <Stethoscope size={18} />
             </div>
-            <div className="overflow-hidden">
-              <div className="text-truncate fw-semibold text-white" style={{ fontSize: '0.82rem' }}>
+            <div className="overflow-hidden flex-grow-1" style={{ minWidth: 0 }}>
+              <div
+                className="text-truncate fw-semibold text-white mb-0"
+                style={{ fontSize: '0.86rem', lineHeight: 1.3 }}
+                title={user?.name || 'Dr. Satya Deep'}
+              >
                 {user?.name || 'Dr. Satya Deep'}
               </div>
-              <div className="text-truncate text-white-50" style={{ fontSize: '0.72rem' }}>
-                Physician & Specialist
+              <div
+                className="text-truncate d-flex align-items-center gap-1"
+                style={{ fontSize: '0.72rem', color: '#94a3b8', lineHeight: 1.2, marginTop: '2px' }}
+              >
+                <span
+                  className="rounded-circle bg-success flex-shrink-0 d-inline-block"
+                  style={{ width: '6px', height: '6px', boxShadow: '0 0 6px rgba(34, 197, 94, 0.6)' }}
+                />
+                <span className="text-truncate">
+                  {user?.doctor_specialization || 'Physician & Specialist'}
+                </span>
               </div>
             </div>
           </div>
         </div>
 
         {/* Navigation Items */}
-        <div className="flex-grow-1 overflow-y-auto px-3 py-2">
+        <div
+          className="flex-grow-1 overflow-y-auto px-3 py-2"
+          style={{ minHeight: 0 }}
+        >
           <div
-            className="text-uppercase text-white-50 px-3 mb-2 font-monospace"
-            style={{ fontSize: '0.68rem', letterSpacing: '0.08em' }}
+            className="text-uppercase px-2 pt-2 mb-2 font-monospace fw-semibold"
+            style={{ fontSize: '0.68rem', letterSpacing: '0.08em', color: '#64748b' }}
           >
             Clinical Workspace
           </div>
@@ -140,7 +167,9 @@ export default function DoctorSidebar({ isOpen, onClose, unreadCount = 0 }) {
                 <NavLink
                   key={item.to}
                   to={item.to}
-                  onClick={onClose}
+                  onClick={() => {
+                    if (window.innerWidth < 992) onClose()
+                  }}
                   className={({ isActive }) =>
                     `d-flex align-items-center justify-content-between px-3 py-2 rounded-3 text-decoration-none transition-all ${
                       isActive
@@ -175,7 +204,7 @@ export default function DoctorSidebar({ isOpen, onClose, unreadCount = 0 }) {
 
         {/* Footer / Logout */}
         <div
-          className="p-3"
+          className="p-3 flex-shrink-0"
           style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)' }}
         >
           <button
