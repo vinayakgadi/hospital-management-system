@@ -235,126 +235,56 @@ export default function PatientDashboard() {
                 Manage All
               </Link>
             </div>
-            <div
-              className="card-body p-3.5 p-md-4 d-flex flex-column justify-content-center"
-              style={{ boxSizing: 'border-box', minWidth: 0, maxWidth: '100%' }}
-            >
+            <div className="card-body p-3.5 p-md-4">
               {nextAppt ? (
-                <div
-                  className="p-3.5 p-md-4 bg-light rounded-4 border w-100"
-                  style={{
-                    boxSizing: 'border-box',
-                    maxWidth: '100%',
-                    minWidth: 0,
-                    overflow: 'hidden',
-                  }}
-                >
-                  <div
-                    className="d-flex flex-column flex-md-row align-items-stretch align-items-md-center justify-content-between gap-3 gap-lg-4 w-100"
-                    style={{
-                      boxSizing: 'border-box',
-                      minWidth: 0,
-                      maxWidth: '100%',
-                    }}
-                  >
-                    {/* Left: Appointment Details */}
-                    <div
-                      className="d-flex flex-column flex-grow-1"
-                      style={{
-                        minWidth: 0,
-                        maxWidth: '100%',
-                        boxSizing: 'border-box',
-                        overflowWrap: 'anywhere',
-                        wordBreak: 'break-word',
-                      }}
-                    >
-                      <div className="d-flex flex-wrap align-items-center gap-2 mb-2">
-                        <span className="badge bg-primary-subtle text-primary fw-medium px-2.5 py-1 rounded-pill">
-                          {nextAppt.status || 'Scheduled'}
-                        </span>
-                      </div>
-
-                      <h5
-                        className="fw-bold text-dark mb-1 text-break"
-                        style={{
-                          minWidth: 0,
-                          maxWidth: '100%',
-                          wordBreak: 'break-word',
-                          overflowWrap: 'anywhere',
-                        }}
-                      >
-                        {nextAppt.reason || 'General Medical Consultation'}
-                      </h5>
-
-                      <p
-                        className="text-muted small mb-0 text-break"
-                        style={{
-                          minWidth: 0,
-                          maxWidth: '100%',
-                          wordBreak: 'break-word',
-                          overflowWrap: 'anywhere',
-                        }}
-                      >
-                        With {formatDoctorName(nextAppt.doctor_name)}
-                        {nextAppt.doctor_specialization ? ` (${nextAppt.doctor_specialization})` : ''}
-                      </p>
+                <div className="upcoming-consultation-card">
+                  {/* Left Column: Appointment Details */}
+                  <div className="upcoming-consultation-details">
+                    <div className="mb-2">
+                      <span className="badge bg-primary-subtle text-primary fw-medium px-2.5 py-1 rounded-pill">
+                        {nextAppt.status || 'Scheduled'}
+                      </span>
                     </div>
 
-                    {/* Right: Date/Time and Actions (desktop: right-aligned; mobile: full-width stacked) */}
-                    <div
-                      className="d-flex flex-column align-items-stretch align-items-md-end justify-content-center gap-2.5 flex-shrink-0 w-100 w-md-auto text-start text-md-end pt-3 pt-md-0 border-top border-md-0"
-                      style={{
-                        minWidth: 0,
-                        maxWidth: '100%',
-                        boxSizing: 'border-box',
-                      }}
-                    >
-                      {/* Date & Time */}
-                      <div
-                        className="d-flex flex-column align-items-start align-items-md-end"
-                        style={{ minWidth: 0, maxWidth: '100%' }}
-                      >
-                        <div
-                          className="fs-6 fw-bold text-primary text-break"
-                          style={{
-                            minWidth: 0,
-                            maxWidth: '100%',
-                            whiteSpace: 'normal',
-                            wordBreak: 'break-word',
-                            overflowWrap: 'anywhere',
-                          }}
-                        >
-                          {formatConsultationDate(nextAppt.appointment_date)}
-                        </div>
-                        {nextAppt.appointment_time && (
-                          <div className="small text-muted d-flex align-items-center gap-1.5 mt-0.5">
-                            <Clock size={13} className="text-secondary flex-shrink-0" />
-                            <span>{nextAppt.appointment_time}</span>
-                          </div>
-                        )}
-                      </div>
+                    <h5 className="fw-bold text-dark mb-1">
+                      {nextAppt.reason || 'General Medical Consultation'}
+                    </h5>
 
-                      {/* Cancel Action */}
-                      <div className="w-100 w-md-auto">
-                        <button
-                          type="button"
-                          onClick={() => handleCancelAppointment(nextAppt.id)}
-                          disabled={cancellingId === nextAppt.id}
-                          className="btn btn-outline-danger btn-sm rounded-3 px-3 py-1.5 w-100 w-md-auto d-inline-flex align-items-center justify-content-center gap-1.5"
-                          style={{ whiteSpace: 'nowrap', maxWidth: '100%' }}
-                        >
-                          <XCircle size={14} className="flex-shrink-0" />
-                          <span>{cancellingId === nextAppt.id ? 'Cancelling...' : 'Cancel Appointment'}</span>
-                        </button>
+                    <p className="text-muted small mb-0">
+                      With {formatDoctorName(nextAppt.doctor_name)}
+                      {nextAppt.doctor_specialization ? ` (${nextAppt.doctor_specialization})` : ''}
+                    </p>
+                  </div>
+
+                  {/* Right Column: Date/Time and Actions */}
+                  <div className="upcoming-consultation-actions">
+                    <div className="d-flex flex-column align-items-start align-items-md-end">
+                      <div className="fs-6 fw-bold text-primary">
+                        {formatConsultationDate(nextAppt.appointment_date)}
                       </div>
+                      {nextAppt.appointment_time && (
+                        <div className="small text-muted d-flex align-items-center gap-1.5 mt-0.5">
+                          <Clock size={13} className="text-secondary flex-shrink-0" />
+                          <span>{nextAppt.appointment_time}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <button
+                        type="button"
+                        onClick={() => handleCancelAppointment(nextAppt.id)}
+                        disabled={cancellingId === nextAppt.id}
+                        className="btn btn-outline-danger btn-sm rounded-3 px-3 py-1.5 d-inline-flex align-items-center gap-1.5"
+                      >
+                        <XCircle size={14} className="flex-shrink-0" />
+                        <span>{cancellingId === nextAppt.id ? 'Cancelling...' : 'Cancel Appointment'}</span>
+                      </button>
                     </div>
                   </div>
                 </div>
               ) : (
-                <div
-                  className="text-center py-4 text-muted"
-                  style={{ minWidth: 0, maxWidth: '100%', boxSizing: 'border-box' }}
-                >
+                <div className="text-center py-4 text-muted">
                   <Calendar size={36} className="text-muted opacity-50 mb-2" />
                   <p className="small mb-3">You have no upcoming appointments scheduled.</p>
                   <Link to="/patient/appointments" className="btn btn-primary btn-sm rounded-3 px-3">
