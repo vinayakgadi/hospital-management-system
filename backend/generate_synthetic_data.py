@@ -86,45 +86,16 @@ DEPARTMENTS_DATA = [
     ("Dental & Maxillofacial Surgery", "DENT", "Orthognathic jaw surgery, dental implants, facial trauma surgery, and pediatric dentistry.", "Tower C, 5th Floor", "+91-80-2345-0125")
 ]
 
-INDIAN_MALE_FIRST_NAMES = [
-    "Aarav", "Vivaan", "Aditya", "Vihaan", "Arjun", "Sai", "Reyansh", "Ayaan", "Krishna", "Ishaan",
-    "Shaurya", "Atharva", "Kabir", "Rudra", "Dhruv", "Rishi", "Dev", "Rajesh", "Amit", "Suresh",
-    "Ramesh", "Manoj", "Venkatesh", "Deepak", "Vikram", "Sunil", "Anil", "Pradeep", "Ashok", "Sanjay",
-    "Praveen", "Mahesh", "Girish", "Kishore", "Raghav", "Madhav", "Karthik", "Gautam", "Naveen", "Satish",
-    "Arun", "Brijesh", "Chetan", "Dinesh", "Ganesh", "Hemant", "Jagdish", "Kailash", "Lalit", "Mohan",
-    "Nitin", "Pankaj", "Rakesh", "Sachin", "Tarun", "Umesh", "Vinod", "Yogesh", "Shravan", "Harish"
-]
+# Pan-Indian demographic and cultural names library
+import indian_names_data as ind
 
-INDIAN_FEMALE_FIRST_NAMES = [
-    "Aadhya", "Diya", "Saanvi", "Ananya", "Pari", "Anika", "Navya", "Angel", "Ira", "Myra",
-    "Sara", "Riya", "Prisha", "Aarohi", "Siya", "Kavya", "Avani", "Khushi", "Sneha", "Pooja",
-    "Sunita", "Anita", "Deepa", "Meena", "Shweta", "Preeti", "Divya", "Swati", "Neha", "Rekha",
-    "Suma", "Lakshmi", "Radha", "Parvati", "Geeta", "Seema", "Vidya", "Usha", "Shubha", "Bhavana",
-    "Chitra", "Damini", "Gayatri", "Harini", "Indira", "Jyoti", "Kalyani", "Lalitha", "Madhavi", "Nandini",
-    "Pallavi", "Rupali", "Sandhya", "Tanvi", "Uma", "Vandana", "Yamuna", "Meenakshi", "Aparna", "Shalini"
-]
-
-INDIAN_LAST_NAMES = [
-    "Sharma", "Verma", "Gupta", "Singh", "Kumar", "Patel", "Shah", "Mehta", "Joshi", "Deshmukh",
-    "Kulkarni", "Patil", "Shinde", "Reddy", "Rao", "Nair", "Pillai", "Iyer", "Iyengar", "Menon",
-    "Murthy", "Swaminathan", "Mukherjee", "Banerjee", "Chatterjee", "Bose", "Ghosh", "Das", "Sen", "Roy",
-    "Agarwal", "Bhatt", "Choudhary", "Dubey", "Garg", "Hegde", "Jha", "Khan", "Lal", "Mishra",
-    "Pandey", "Qureshi", "Rawat", "Saxena", "Tiwari", "Upadhyay", "Venkataraman", "Wadhwa", "Yadav", "Zaidi",
-    "Bhatnagar", "Chakraborty", "Deshpande", "Gokhale", "Majumdar", "Nambiar", "Purohit", "Ranganathan", "Shetty", "Tripathi"
-]
-
-INDIAN_CITIES = [
-    ("Bengaluru", "Karnataka", ["Indiranagar", "Koramangala", "Whitefield", "Jayanagar", "Malleshwaram", "HSR Layout", "JP Nagar", "Marathahalli"], "5600"),
-    ("Mumbai", "Maharashtra", ["Andheri West", "Bandra", "Dadar", "Borivali", "Goregaon", "Juhu", "Powai", "Thane"], "4000"),
-    ("New Delhi", "Delhi", ["Rohini", "Dwarka", "Saket", "Vasant Kunj", "Karol Bagh", "Lajpat Nagar", "Hauz Khas", "Connaught Place"], "1100"),
-    ("Hyderabad", "Telangana", ["Banjara Hills", "Jubilee Hills", "Gachibowli", "Madhapur", "Kukatpally", "Begumpet", "Ameerpet", "Secunderabad"], "5000"),
-    ("Chennai", "Tamil Nadu", ["T. Nagar", "Anna Nagar", "Adyar", "Mylapore", "Velachery", "Nungambakkam", "Besant Nagar", "Guindy"], "6000"),
-    ("Kolkata", "West Bengal", ["Salt Lake", "New Town", "Ballygunge", "Alipore", "Park Street", "Howrah", "Dum Dum", "Garia"], "7000"),
-    ("Pune", "Maharashtra", ["Kothrud", "Viman Nagar", "Hinjewadi", "Aundh", "Wakad", "Baner", "Kalyani Nagar", "Shivajinagar"], "4110"),
-    ("Ahmedabad", "Gujarat", ["Satellite", "Bodakdev", "Navrangpura", "Vastrapur", "Maninagar", "Prahlad Nagar", "Thaltej", "Paldi"], "3800"),
-    ("Jaipur", "Rajasthan", ["Malviya Nagar", "Vaishali Nagar", "Mansarovar", "C-Scheme", "Raja Park", "Bani Park", "Tonk Road", "Jagatpura"], "3020"),
-    ("Lucknow", "Uttar Pradesh", ["Gomti Nagar", "Hazratganj", "Aliganj", "Indira Nagar", "Mahanagar", "Janki Puram", "Ashiyana", "Vikas Nagar"], "2260")
-]
+INDIAN_MALE_FIRST_NAMES = list(set(ind.INDIAN_MALE_FIRST_NAMES))
+INDIAN_FEMALE_FIRST_NAMES = list(set(ind.INDIAN_FEMALE_FIRST_NAMES))
+INDIAN_LAST_NAMES = list(set(ind.INDIAN_LAST_NAMES))
+INDIAN_MALE_MIDDLE_NAMES = ind.INDIAN_MALE_MIDDLE_NAMES
+INDIAN_FEMALE_MIDDLE_NAMES = ind.INDIAN_FEMALE_MIDDLE_NAMES
+INDIAN_MIDDLE_INITIALS = ind.INDIAN_MIDDLE_INITIALS
+INDIAN_CITIES = ind.INDIAN_CITIES
 
 MEDICAL_DISEASES = [
     ("Type 2 Diabetes Mellitus", "Endocrinology & Diabetology"),
@@ -234,28 +205,62 @@ LAB_TEST_TEMPLATES = [
 # GENERATOR HELPER FUNCTIONS
 # =====================================================================
 
-def generate_indian_name(gender='Any'):
-    if gender == 'Male':
-        first = random.choice(INDIAN_MALE_FIRST_NAMES)
-    elif gender == 'Female':
-        first = random.choice(INDIAN_FEMALE_FIRST_NAMES)
-    else:
-        first = random.choice(INDIAN_MALE_FIRST_NAMES if random.random() < 0.52 else INDIAN_FEMALE_FIRST_NAMES)
-    last = random.choice(INDIAN_LAST_NAMES)
-    return f"{first} {last}"
+def generate_indian_name(gender='Any', prefix='', used_names_set=None):
+    if used_names_set is None:
+        used_names_set = set()
+    for _ in range(50000):
+        g = gender
+        if g not in ('Male', 'Female'):
+            g = 'Male' if random.random() < 0.51 else 'Female'
+        first = random.choice(INDIAN_MALE_FIRST_NAMES if g == 'Male' else INDIAN_FEMALE_FIRST_NAMES)
+        last = random.choice(INDIAN_LAST_NAMES)
+        dice = random.random()
+        if dice < 0.42:
+            base = f"{first} {last}"
+        elif dice < 0.78:
+            mid = random.choice(INDIAN_MALE_MIDDLE_NAMES if g == 'Male' else INDIAN_FEMALE_MIDDLE_NAMES)
+            base = f"{first} {mid} {last}"
+        else:
+            init = random.choice(INDIAN_MIDDLE_INITIALS)
+            base = f"{first} {init} {last}"
+        full = f"{prefix}{base}".strip()
+        if base not in used_names_set and full not in used_names_set:
+            used_names_set.add(base)
+            used_names_set.add(full)
+            return full, base, first, last, g
+    raise RuntimeError("Exhausted unique Indian names space.")
 
-def generate_indian_phone():
-    prefix = random.choice(["98", "97", "96", "94", "93", "91", "88", "87", "80", "79", "70"])
-    digits = "".join([str(random.randint(0, 9)) for _ in range(8)])
-    return f"+91 {prefix}{digits[:4]} {digits[4:]}"
+def generate_indian_phone(used_phones_set=None):
+    prefixes = ["98", "97", "96", "95", "94", "93", "91", "90", "89", "88", "87", "86", "85", "84", "82", "81", "80", "79", "78", "77", "76", "75", "74", "73", "72", "70", "63", "62"]
+    for _ in range(50000):
+        pref = random.choice(prefixes)
+        digits = "".join([str(random.randint(0, 9)) for _ in range(8)])
+        phone = f"+91 {pref}{digits[:4]} {digits[4:]}"
+        if used_phones_set is None or phone not in used_phones_set:
+            if used_phones_set is not None:
+                used_phones_set.add(phone)
+            return phone
+    raise RuntimeError("Exhausted unique phone numbers.")
 
 def generate_indian_address():
+    building_types = ["Flat", "Apartment", "Apt", "Villa", "Plot", "House No.", "Bungalow", "Penthouse", "Tower", "Enclave", "Residency"]
+    street_types = ["Cross", "Main Road", "Lane", "Avenue", "Boulevard", "Sector", "Block", "Phase", "Layout", "Bypass Road"]
     city_info = random.choice(INDIAN_CITIES)
     city_name, state_name, localities, pin_prefix = city_info
     locality = random.choice(localities)
-    door_no = f"#{random.randint(1, 150)}, {random.choice(['Flat', 'Apt', 'Villa', 'Plot'])} {random.randint(101, 804)}"
-    pin_code = f"{pin_prefix}{random.randint(10, 99)}"
-    return f"{door_no}, {locality}, {city_name}, {state_name} - {pin_code}"
+    b_type = random.choice(building_types)
+    s_type = random.choice(street_types)
+    door_num = random.randint(1, 250)
+    street_num = random.randint(1, 24)
+    if b_type in ("Flat", "Apt", "Apartment"):
+        flat_num = f"{random.choice(['A', 'B', 'C', 'D', 'E'])}-{random.randint(101, 1404)}"
+        addr_line = f"{flat_num}, {random.choice(['Sai', 'Sri', 'Green', 'Shanti', 'Royal', 'Galaxy', 'Krishna', 'Surya', 'Fortune'])} {b_type}, {street_num}th {s_type}"
+    elif b_type in ("Villa", "Plot", "House No."):
+        addr_line = f"#{door_num}, {random.choice(['Silver', 'Golden', 'Palm', 'Orchid', 'Tulip', 'Rose', 'Lakeview'])} {b_type}, Road No. {street_num}"
+    else:
+        addr_line = f"No. {door_num}, {street_num}th {s_type}, Near {random.choice(['Water Tank', 'Metro Station', 'Community Hall', 'Main Market', 'Central Park', 'Temple'])}"
+    pin_suffix = f"{random.randint(11, 98):02d}"
+    return f"{addr_line}, {locality}, {city_name}, {state_name} - {pin_prefix}{pin_suffix}"
 
 def random_date_between(start_date, end_date):
     delta = end_date - start_date
@@ -278,6 +283,41 @@ class HospitalSyntheticDataGenerator:
         self.cur = self.raw_conn.cursor()
         self.now = datetime.datetime.now()
         self.stats = {}
+        self.used_names = set()
+        self.used_emails = set()
+        self.used_phones = set()
+        self._load_uniqueness_registry()
+
+    def _load_uniqueness_registry(self):
+        try:
+            self.cur.execute("SELECT name, email FROM users;")
+            for r in self.cur.fetchall():
+                if r[0]: self.used_names.add(r[0].strip())
+                if r[1]: self.used_emails.add(r[1].strip().lower())
+
+            self.cur.execute("SELECT name, email, phone FROM doctors;")
+            for r in self.cur.fetchall():
+                if r[0]:
+                    self.used_names.add(r[0].strip())
+                    clean = re.sub(r'^Dr\.?\s*', '', r[0]).strip()
+                    self.used_names.add(clean)
+                if r[1]: self.used_emails.add(r[1].strip().lower())
+                if r[2]: self.used_phones.add(r[2].strip())
+
+            self.cur.execute("SELECT name, email, phone FROM staff;")
+            for r in self.cur.fetchall():
+                if r[0]: self.used_names.add(r[0].strip())
+                if r[1]: self.used_emails.add(r[1].strip().lower())
+                if r[2]: self.used_phones.add(r[2].strip())
+
+            self.cur.execute("SELECT name, email, phone, emergency_contact_phone FROM patients;")
+            for r in self.cur.fetchall():
+                if r[0]: self.used_names.add(r[0].strip())
+                if r[1]: self.used_emails.add(r[1].strip().lower())
+                if r[2]: self.used_phones.add(r[2].strip())
+                if r[3]: self.used_phones.add(r[3].strip())
+        except Exception as e:
+            self.log("registry", f"Notice: Error preloading uniqueness registry ({e}). Starting fresh.")
 
     def close(self):
         try:
@@ -357,18 +397,23 @@ class HospitalSyntheticDataGenerator:
 
         for i in range(needed):
             doc_idx = start_id + i
-            gender = 'Male' if random.random() < 0.60 else 'Female'
-            name = f"Dr. {generate_indian_name(gender)}"
-            email = f"dr.{doc_idx}.{random.choice(['aiims', 'apollo', 'healthpulse'])}@healthpulse.com"
-            while email in existing_emails:
-                email = f"dr.{doc_idx}_{random.randint(100, 999)}@healthpulse.com"
+            gender = 'Male' if random.random() < 0.58 else 'Female'
+            name, base, first, last, g = generate_indian_name(
+                gender=gender, prefix="Dr. ", used_names_set=self.used_names
+            )
+            clean_f = re.sub(r'[^a-zA-Z0-9]', '', first).lower()
+            clean_l = re.sub(r'[^a-zA-Z0-9]', '', last).lower()
+            email = f"dr.{clean_f}.{clean_l}@healthpulse.com"
+            if email in self.used_emails or email in existing_emails:
+                email = f"dr.{clean_f}.{clean_l}.{doc_idx}@healthpulse.com"
+            self.used_emails.add(email)
             existing_emails.add(email)
 
             dept_id = dept_ids[i % len(dept_ids)]
             dept_name = dept_names[dept_id]
             spec = dept_name.split('&')[0].strip()
 
-            phone = generate_indian_phone()
+            phone = generate_indian_phone(self.used_phones)
             exp = random.randint(5, 32)
             quals = random.choice([
                 f"MBBS, MD ({spec}) - AIIMS New Delhi",
@@ -453,12 +498,19 @@ class HospitalSyntheticDataGenerator:
             s_idx = current_count + i + 1
             dept_id = random.choice(dept_ids) if dept_ids else None
             gender = 'Female' if random.random() < 0.65 else 'Male'
-            name = generate_indian_name(gender)
+            name, base, first, last, g = generate_indian_name(
+                gender=gender, prefix="", used_names_set=self.used_names
+            )
             role_info = random.choice(roles_pool)
             role_name, qual, base_salary = role_info
-            clean_fname = re.sub(r'[^a-zA-Z0-9]', '', name.split()[0]).lower()
-            email = f"staff.{s_idx}.{clean_fname}@healthpulse.com"
-            phone = generate_indian_phone()
+            clean_f = re.sub(r'[^a-zA-Z0-9]', '', first).lower()
+            clean_l = re.sub(r'[^a-zA-Z0-9]', '', last).lower()
+            email = f"staff.{clean_f}.{clean_l}@healthpulse.com"
+            if email in self.used_emails:
+                email = f"staff.{clean_f}.{clean_l}.{s_idx}@healthpulse.com"
+            self.used_emails.add(email)
+
+            phone = generate_indian_phone(self.used_phones)
             shift = random.choice(shifts)
             salary = base_salary + round(random.uniform(-3000, 8000), -2)
             joined = random_date_between(start_date, end_date)
@@ -508,22 +560,34 @@ class HospitalSyntheticDataGenerator:
         for i in range(needed):
             p_idx = start_id + i
             gender = 'Male' if random.random() < 0.51 else 'Female'
-            name = generate_indian_name(gender)
+            name, base, first, last, g = generate_indian_name(
+                gender=gender, prefix="", used_names_set=self.used_names
+            )
             age = int(random.triangular(1, 90, 42))
             weight_val = round(random.uniform(45.0, 95.0), 1) if age > 15 else round(random.uniform(3.5, 40.0), 1)
             weight = f"{weight_val} kg"
 
-            email = f"patient.{p_idx}.{random.randint(100, 999)}@healthpulse.com"
+            clean_f = re.sub(r'[^a-zA-Z0-9]', '', first).lower()
+            clean_l = re.sub(r'[^a-zA-Z0-9]', '', last).lower()
+            email = f"patient.{clean_f}.{clean_l}.{p_idx}@healthpulse.com"
+            self.used_emails.add(email)
+
             disease_item = random.choice(MEDICAL_DISEASES)
             disease_name = disease_item[0]
 
             doc = random.choice(doctors)
             doc_id, doc_name, doc_spec = doc[0], doc[1], doc[2]
 
-            phone = generate_indian_phone()
+            phone = generate_indian_phone(self.used_phones)
             addr = generate_indian_address()
-            em_name = generate_indian_name()
-            em_phone = generate_indian_phone()
+
+            # Emergency contact
+            em_gender = 'Female' if random.random() < 0.50 else 'Male'
+            em_first = random.choice(INDIAN_MALE_FIRST_NAMES if em_gender == 'Male' else INDIAN_FEMALE_FIRST_NAMES)
+            em_last = last if random.random() < 0.65 else random.choice(INDIAN_LAST_NAMES)
+            em_name = f"{em_first} {em_last}"
+            em_phone = generate_indian_phone(self.used_phones)
+
             dob_year = 2026 - age
             dob = f"{dob_year}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
             bg = random.choice(blood_groups)
