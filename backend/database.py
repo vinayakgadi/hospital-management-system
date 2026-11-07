@@ -119,9 +119,10 @@ class PostgresCursorWrapper:
         q = re.sub(r"date\s*\(\s*['\"]now['\"]\s*\)", "CURRENT_DATE", q, flags=re.IGNORECASE)
         # Translate datetime('now') to CURRENT_TIMESTAMP
         q = re.sub(r"datetime\s*\(\s*['\"]now['\"]\s*\)", "CURRENT_TIMESTAMP", q, flags=re.IGNORECASE)
-        # Translate literal boolean integers in VALUES: , 1) -> , TRUE), , 0) -> , FALSE)
-        q = re.sub(r",\s*1\s*\)", ", TRUE)", q)
-        q = re.sub(r",\s*0\s*\)", ", FALSE)", q)
+        # Translate literal boolean integers only within INSERT VALUES clauses: VALUES (..., 1) -> VALUES (..., TRUE)
+        if "VALUES" in q.upper():
+            q = re.sub(r"(VALUES\s*\([^)]*),\s*1\s*\)", r"\1, TRUE)", q, flags=re.IGNORECASE)
+            q = re.sub(r"(VALUES\s*\([^)]*),\s*0\s*\)", r"\1, FALSE)", q, flags=re.IGNORECASE)
         # Translate is_active = ? to is_active = (?)::boolean
         q = re.sub(r"\bis_active\s*=\s*\?", "is_active = (?)::boolean", q, flags=re.IGNORECASE)
         # Translate date(?) to (%s)::date

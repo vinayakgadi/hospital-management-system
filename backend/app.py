@@ -1591,7 +1591,19 @@ def get_admin_dashboard_stats():
             (SELECT COUNT(*) FROM patients) as total_patients,
             (SELECT COUNT(*) FROM doctors) as total_doctors,
             (SELECT COUNT(*) FROM appointments) as total_appointments,
-            (SELECT COUNT(DISTINCT disease) FROM patients WHERE disease IS NOT NULL AND disease != '') as active_conditions
+            (SELECT COUNT(DISTINCT disease) FROM patients WHERE disease IS NOT NULL AND disease != '') as active_conditions,
+            (SELECT COUNT(*) FROM departments) as total_departments,
+            (SELECT COUNT(*) FROM staff) as total_staff,
+            (SELECT COUNT(*) FROM medicines) as total_medicines,
+            (SELECT COUNT(*) FROM rooms) as total_rooms,
+            (SELECT COUNT(*) FROM beds) as total_beds,
+            (SELECT COUNT(*) FROM beds WHERE status = 'Occupied') as occupied_beds,
+            (SELECT COUNT(*) FROM beds WHERE status = 'Available') as available_beds,
+            (SELECT COUNT(*) FROM admissions WHERE status = 'Admitted') as active_admissions,
+            (SELECT COUNT(*) FROM admissions) as total_admissions,
+            (SELECT COUNT(*) FROM discharges) as total_discharges,
+            (SELECT COALESCE(SUM(paid_amount), 0) FROM billing_records) as total_revenue,
+            (SELECT COALESCE(SUM(balance_amount), 0) FROM billing_records) as outstanding_balance
     """)
     row = cursor.fetchone()
     conn.close()
@@ -1600,17 +1612,45 @@ def get_admin_dashboard_stats():
     total_doctors = row["total_doctors"] or 0
     total_appointments = row["total_appointments"] or 0
     active_conditions = row["active_conditions"] or 0
+    total_departments = row["total_departments"] or 0
+    total_staff = row["total_staff"] or 0
+    total_medicines = row["total_medicines"] or 0
+    total_rooms = row["total_rooms"] or 0
+    total_beds = row["total_beds"] or 0
+    occupied_beds = row["occupied_beds"] or 0
+    available_beds = row["available_beds"] or 0
+    active_admissions = row["active_admissions"] or 0
+    total_admissions = row["total_admissions"] or 0
+    total_discharges = row["total_discharges"] or 0
+    total_revenue = float(row["total_revenue"] or 0)
+    outstanding_balance = float(row["outstanding_balance"] or 0)
+
+    occupancy_pct = round((occupied_beds / total_beds * 100), 1) if total_beds > 0 else 0.0
 
     return jsonify({
         "total_patients": total_patients,
         "total_doctors": total_doctors,
         "total_appointments": total_appointments,
         "active_conditions": active_conditions,
+        "total_departments": total_departments,
+        "total_staff": total_staff,
+        "total_medicines": total_medicines,
+        "total_rooms": total_rooms,
+        "total_beds": total_beds,
+        "occupied_beds": occupied_beds,
+        "available_beds": available_beds,
+        "bed_occupancy_rate": f"{occupancy_pct}%",
+        "active_admissions": active_admissions,
+        "total_admissions": total_admissions,
+        "total_discharges": total_discharges,
+        "total_revenue": total_revenue,
+        "outstanding_balance": outstanding_balance,
         "trends": {
             "patients": "+14% from last month",
-            "doctors": "+2 newly registered",
+            "doctors": f"Across {total_departments} clinical specialties",
             "appointments": "+8% this week",
-            "conditions": "Across 4 departments"
+            "conditions": f"Across {total_departments} departments",
+            "occupancy": f"{occupancy_pct}% bed utilization"
         }
     })
 
@@ -3896,6 +3936,26 @@ def build_patient_dashboard_response(patient_id, current_user):
             if vs.get("temperature") or vs.get("temp"):
                 latest_vitals["temperature"] = f"{vs.get('temperature') or vs.get('temp')}"
 
+    # Billing & Financial Summary for this patient
+    cursor.execute("""
+        SELECT COUNT(*) as count,
+               COALESCE(SUM(net_amount), 0) as total_billed,
+               COALESCE(SUM(paid_amount), 0) as total_paid,
+               COALESCE(SUM(balance_amount), 0) as total_balance
+        FROM billing_records
+        WHERE patient_id = ?
+    """, (patient_id,))
+    billing_stats = cursor.fetchone()
+
+    cursor.execute("""
+        SELECT id, bill_number, net_amount, paid_amount, balance_amount, status, bill_date, due_date
+        FROM billing_records
+        WHERE patient_id = ?
+        ORDER BY bill_date DESC
+        LIMIT 4;
+    """, (patient_id,))
+    recent_bills = [dict(r) for r in cursor.fetchall()]
+
     conn.close()
 
     return jsonify({
@@ -3907,12 +3967,17 @@ def build_patient_dashboard_response(patient_id, current_user):
             "active_prescriptions": active_prescriptions_count,
             "lab_results": lab_results_count,
             "unread_notifications": unread_notifs_count,
+            "total_bills": billing_stats["count"] or 0,
+            "total_billed": float(billing_stats["total_billed"] or 0),
+            "total_paid": float(billing_stats["total_paid"] or 0),
+            "balance_due": float(billing_stats["total_balance"] or 0)
         },
         "next_appointment": next_appointment,
         "appointments": appointments,
         "recent_records": recent_records,
         "recent_prescriptions": recent_prescriptions,
         "recent_labs": recent_labs,
+        "recent_bills": recent_bills,
         "latest_vitals": latest_vitals
     })
 
@@ -5842,6 +5907,724 @@ def get_system_health(current_user):
             "active_sessions": tokens_count,
             "server_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         }
+    })
+
+
+# ---------------------------------------------------------
+# HOSPITAL MANAGEMENT SYSTEM: CORE CLINICAL & OPERATIONS ENDPOINTS
+# ---------------------------------------------------------
+
+@app.route("/api/departments", methods=["GET"])
+def get_departments():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            d.id, d.name, d.code, d.description, d.phone, d.location,
+            doc.name as head_doctor_name, doc.specialization as head_doctor_specialization,
+            (SELECT COUNT(*) FROM doctors doc2 WHERE doc2.department_id = d.id) as doctor_count,
+            (SELECT COUNT(*) FROM staff s WHERE s.department_id = d.id) as staff_count,
+            (SELECT COUNT(*) FROM rooms r WHERE r.department_id = d.id) as room_count
+        FROM departments d
+        LEFT JOIN doctors doc ON d.head_doctor_id = doc.id
+        ORDER BY d.id ASC;
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return jsonify({
+        "departments": [dict(r) for r in rows],
+        "total": len(rows)
+    })
+
+
+@app.route("/api/staff", methods=["GET"])
+def get_staff_list():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    search = request.args.get("search", "").strip()
+    role = request.args.get("role", "").strip()
+    dept_id = request.args.get("department_id", type=int)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+
+    if search:
+        where_clauses.append("(s.name LIKE ? OR s.email LIKE ? OR s.qualification LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+    if role:
+        where_clauses.append("s.role = ?")
+        params.append(role)
+    if dept_id:
+        where_clauses.append("s.department_id = ?")
+        params.append(dept_id)
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"SELECT COUNT(*) as count FROM staff s WHERE {where_sql}", tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            s.id, s.name, s.role, s.email, s.phone, s.shift, s.status,
+            s.qualification, s.salary, s.joined_date, s.created_at,
+            d.name as department_name, d.code as department_code
+        FROM staff s
+        LEFT JOIN departments d ON s.department_id = d.id
+        WHERE {where_sql}
+        ORDER BY s.id ASC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "staff": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/medicines", methods=["GET"])
+def get_medicines_catalog():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    search = request.args.get("search", "").strip()
+    category = request.args.get("category", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+
+    if search:
+        where_clauses.append("(m.name LIKE ? OR m.generic_name LIKE ? OR m.manufacturer LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+    if category:
+        where_clauses.append("m.category = ?")
+        params.append(category)
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"SELECT COUNT(*) as count FROM medicines m WHERE {where_sql}", tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            m.id, m.name, m.generic_name, m.category, m.dosage_form,
+            m.strength, m.manufacturer, m.price, m.stock_quantity,
+            m.reorder_level, m.expiry_date, m.created_at
+        FROM medicines m
+        WHERE {where_sql}
+        ORDER BY m.name ASC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+
+    # Also retrieve distinct categories for filter dropdowns
+    cursor.execute("SELECT DISTINCT category FROM medicines WHERE category IS NOT NULL ORDER BY category;")
+    categories = [r["category"] for r in cursor.fetchall()]
+
+    conn.close()
+
+    return jsonify({
+        "medicines": [dict(r) for r in rows],
+        "categories": categories,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/rooms", methods=["GET"])
+def get_rooms():
+    dept_id = request.args.get("department_id", type=int)
+    room_type = request.args.get("room_type", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if dept_id:
+        where_clauses.append("r.department_id = ?")
+        params.append(dept_id)
+    if room_type:
+        where_clauses.append("r.room_type = ?")
+        params.append(room_type)
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT 
+            r.id, r.room_number, r.room_type, r.floor, r.charge_per_day, r.status,
+            d.name as department_name, d.code as department_code,
+            (SELECT COUNT(*) FROM beds b WHERE b.room_id = r.id) as total_beds,
+            (SELECT COUNT(*) FROM beds b WHERE b.room_id = r.id AND b.status = 'Occupied') as occupied_beds,
+            (SELECT COUNT(*) FROM beds b WHERE b.room_id = r.id AND b.status = 'Available') as available_beds
+        FROM rooms r
+        LEFT JOIN departments d ON r.department_id = d.id
+        WHERE {where_sql}
+        ORDER BY r.floor ASC, r.room_number ASC;
+    """, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "rooms": [dict(r) for r in rows],
+        "total": len(rows)
+    })
+
+
+@app.route("/api/beds", methods=["GET"])
+def get_beds():
+    status = request.args.get("status", "").strip()
+    room_id = request.args.get("room_id", type=int)
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 50, type=int)))
+    offset = (page - 1) * limit
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if status:
+        where_clauses.append("b.status = ?")
+        params.append(status)
+    if room_id:
+        where_clauses.append("b.room_id = ?")
+        params.append(room_id)
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"SELECT COUNT(*) as count FROM beds b WHERE {where_sql}", tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            b.id, b.bed_number, b.status, b.created_at,
+            r.room_number, r.room_type, r.floor, r.charge_per_day,
+            d.name as department_name
+        FROM beds b
+        JOIN rooms r ON b.room_id = r.id
+        LEFT JOIN departments d ON r.department_id = d.id
+        WHERE {where_sql}
+        ORDER BY b.id ASC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "beds": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/beds/summary", methods=["GET"])
+def get_beds_summary():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_beds,
+            COUNT(CASE WHEN status = 'Occupied' THEN 1 END) as occupied_beds,
+            COUNT(CASE WHEN status = 'Available' THEN 1 END) as available_beds
+        FROM beds;
+    """)
+    row = cursor.fetchone()
+    conn.close()
+
+    total = row["total_beds"] or 0
+    occupied = row["occupied_beds"] or 0
+    available = row["available_beds"] or 0
+    rate = round((occupied / total * 100), 1) if total > 0 else 0.0
+
+    return jsonify({
+        "total_beds": total,
+        "occupied_beds": occupied,
+        "available_beds": available,
+        "occupancy_rate": f"{rate}%"
+    })
+
+
+@app.route("/api/admissions", methods=["GET"])
+def get_admissions():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if status:
+        where_clauses.append("a.status = ?")
+        params.append(status)
+    if search:
+        where_clauses.append("(a.admission_number LIKE ? OR p.name LIKE ? OR doc.name LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count 
+        FROM admissions a
+        JOIN patients p ON a.patient_id = p.id
+        LEFT JOIN doctors doc ON a.attending_doctor_id = doc.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            a.id, a.admission_number, a.admission_date, a.admission_reason,
+            a.diagnosis, a.status, a.created_at,
+            p.id as patient_id, p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+            b.bed_number, r.room_number, r.room_type,
+            doc.id as doctor_id, doc.name as doctor_name, doc.specialization as doctor_specialization
+        FROM admissions a
+        JOIN patients p ON a.patient_id = p.id
+        JOIN beds b ON a.bed_id = b.id
+        JOIN rooms r ON b.room_id = r.id
+        LEFT JOIN doctors doc ON a.attending_doctor_id = doc.id
+        WHERE {where_sql}
+        ORDER BY a.admission_date DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "admissions": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/admissions/stats", methods=["GET"])
+def get_admissions_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_admissions,
+            COUNT(CASE WHEN status = 'Admitted' THEN 1 END) as active_admissions,
+            COUNT(CASE WHEN status = 'Discharged' THEN 1 END) as discharged_admissions
+        FROM admissions;
+    """)
+    row = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "total_admissions": row["total_admissions"] or 0,
+        "active_admissions": row["active_admissions"] or 0,
+        "discharged_admissions": row["discharged_admissions"] or 0
+    })
+
+
+@app.route("/api/discharges", methods=["GET"])
+def get_discharges():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if search:
+        where_clauses.append("(p.name LIKE ? OR a.admission_number LIKE ? OR d.condition_at_discharge LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count
+        FROM discharges d
+        JOIN patients p ON d.patient_id = p.id
+        JOIN admissions a ON d.admission_id = a.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            d.id, d.discharge_date, d.discharge_summary, d.condition_at_discharge,
+            d.follow_up_instructions, d.created_at,
+            p.id as patient_id, p.name as patient_name,
+            a.admission_number, a.admission_date, a.diagnosis
+        FROM discharges d
+        JOIN patients p ON d.patient_id = p.id
+        JOIN admissions a ON d.admission_id = a.id
+        WHERE {where_sql}
+        ORDER BY d.discharge_date DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "discharges": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/billing", methods=["GET"])
+def get_billing_records():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if status:
+        where_clauses.append("br.status = ?")
+        params.append(status)
+    if search:
+        where_clauses.append("(br.bill_number LIKE ? OR p.name LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count
+        FROM billing_records br
+        JOIN patients p ON br.patient_id = p.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            br.id, br.bill_number, br.total_amount, br.discount_amount,
+            br.tax_amount, br.net_amount, br.paid_amount, br.balance_amount,
+            br.status, br.bill_date, br.due_date, br.created_at,
+            p.id as patient_id, p.name as patient_name, p.email as patient_email, p.phone as patient_phone,
+            br.appointment_id, br.admission_id
+        FROM billing_records br
+        JOIN patients p ON br.patient_id = p.id
+        WHERE {where_sql}
+        ORDER BY br.bill_date DESC, br.id DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "billing_records": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/billing/stats", methods=["GET"])
+def get_billing_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_bills,
+            COALESCE(SUM(total_amount), 0) as gross_billed,
+            COALESCE(SUM(discount_amount), 0) as total_discounts,
+            COALESCE(SUM(tax_amount), 0) as total_tax,
+            COALESCE(SUM(net_amount), 0) as net_billed,
+            COALESCE(SUM(paid_amount), 0) as total_collected,
+            COALESCE(SUM(balance_amount), 0) as total_outstanding,
+            COUNT(CASE WHEN status = 'Paid' THEN 1 END) as paid_invoices,
+            COUNT(CASE WHEN status = 'Partially Paid' THEN 1 END) as partial_invoices,
+            COUNT(CASE WHEN status = 'Pending' THEN 1 END) as pending_invoices,
+            COUNT(CASE WHEN status = 'Overdue' THEN 1 END) as overdue_invoices
+        FROM billing_records;
+    """)
+    row = cursor.fetchone()
+    conn.close()
+
+    net = float(row["net_billed"] or 0)
+    collected = float(row["total_collected"] or 0)
+    collection_rate = round((collected / net * 100), 1) if net > 0 else 0.0
+
+    return jsonify({
+        "total_bills": row["total_bills"] or 0,
+        "gross_billed": float(row["gross_billed"] or 0),
+        "total_discounts": float(row["total_discounts"] or 0),
+        "total_tax": float(row["total_tax"] or 0),
+        "net_billed": net,
+        "total_collected": collected,
+        "total_outstanding": float(row["total_outstanding"] or 0),
+        "collection_rate": f"{collection_rate}%",
+        "breakdown_by_status": {
+            "paid": row["paid_invoices"] or 0,
+            "partially_paid": row["partial_invoices"] or 0,
+            "pending": row["pending_invoices"] or 0,
+            "overdue": row["overdue_invoices"] or 0
+        }
+    })
+
+
+@app.route("/api/payments", methods=["GET"])
+def get_payments():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    method = request.args.get("method", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if method:
+        where_clauses.append("py.payment_method = ?")
+        params.append(method)
+    if search:
+        where_clauses.append("(py.payment_number LIKE ? OR py.transaction_reference LIKE ? OR p.name LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count
+        FROM payments py
+        JOIN patients p ON py.patient_id = p.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            py.id, py.payment_number, py.amount, py.payment_method,
+            py.transaction_reference, py.status, py.payment_date, py.created_at,
+            br.bill_number, br.net_amount as bill_net_amount,
+            p.id as patient_id, p.name as patient_name
+        FROM payments py
+        JOIN billing_records br ON py.bill_id = br.id
+        JOIN patients p ON py.patient_id = p.id
+        WHERE {where_sql}
+        ORDER BY py.payment_date DESC, py.id DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "payments": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/payments/stats", methods=["GET"])
+def get_payments_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            payment_method,
+            COUNT(*) as count,
+            COALESCE(SUM(amount), 0) as total_amount
+        FROM payments
+        GROUP BY payment_method
+        ORDER BY total_amount DESC;
+    """)
+    rows = cursor.fetchall()
+
+    cursor.execute("SELECT COUNT(*) as total_count, COALESCE(SUM(amount), 0) as total_collected FROM payments;")
+    summary = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "total_transactions": summary["total_count"] or 0,
+        "total_amount_collected": float(summary["total_collected"] or 0),
+        "methods": [
+            {
+                "method": r["payment_method"],
+                "count": r["count"],
+                "amount": float(r["total_amount"])
+            }
+            for r in rows
+        ]
+    })
+
+
+@app.route("/api/patient/billing", methods=["GET"])
+@require_role("patient")
+def get_current_patient_billing(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Retrieve patient's invoices
+    cursor.execute("""
+        SELECT 
+            br.id, br.bill_number, br.total_amount, br.discount_amount,
+            br.tax_amount, br.net_amount, br.paid_amount, br.balance_amount,
+            br.status, br.bill_date, br.due_date, br.created_at,
+            br.appointment_id, br.admission_id
+        FROM billing_records br
+        WHERE br.patient_id = ?
+        ORDER BY br.bill_date DESC, br.id DESC;
+    """, (patient_id,))
+    invoices = [dict(r) for r in cursor.fetchall()]
+
+    # Retrieve patient's payment transactions
+    cursor.execute("""
+        SELECT 
+            py.id, py.payment_number, py.bill_id, py.amount, py.payment_method,
+            py.transaction_reference, py.status, py.payment_date,
+            br.bill_number
+        FROM payments py
+        JOIN billing_records br ON py.bill_id = br.id
+        WHERE py.patient_id = ?
+        ORDER BY py.payment_date DESC;
+    """, (patient_id,))
+    payments = [dict(r) for r in cursor.fetchall()]
+
+    # Calculate summary metrics
+    total_billed = sum(float(inv["net_amount"]) for inv in invoices)
+    total_paid = sum(float(inv["paid_amount"]) for inv in invoices)
+    total_balance = sum(float(inv["balance_amount"]) for inv in invoices)
+
+    conn.close()
+
+    return jsonify({
+        "invoices": invoices,
+        "payments": payments,
+        "summary": {
+            "total_invoices": len(invoices),
+            "total_billed": round(total_billed, 2),
+            "total_paid": round(total_paid, 2),
+            "total_balance": round(total_balance, 2)
+        }
+    })
+
+
+@app.route("/api/lab-reports", methods=["GET"])
+def get_lab_reports():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if status:
+        where_clauses.append("lr.status = ?")
+        params.append(status)
+    if search:
+        where_clauses.append("(lr.test_name LIKE ? OR p.name LIKE ? OR d.name LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count
+        FROM lab_results lr
+        JOIN patients p ON lr.patient_id = p.id
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            lr.id, lr.test_name, lr.test_date, lr.result_value, lr.units,
+            lr.reference_range, lr.status, lr.notes, lr.created_at,
+            p.id as patient_id, p.name as patient_name,
+            d.id as doctor_id, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM lab_results lr
+        JOIN patients p ON lr.patient_id = p.id
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE {where_sql}
+        ORDER BY lr.test_date DESC, lr.id DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "lab_reports": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/lab-reports/stats", methods=["GET"])
+def get_lab_reports_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_reports,
+            COUNT(CASE WHEN status = 'Normal' THEN 1 END) as normal_count,
+            COUNT(CASE WHEN status = 'High' THEN 1 END) as high_count,
+            COUNT(CASE WHEN status = 'Low' THEN 1 END) as low_count,
+            COUNT(CASE WHEN status = 'Critical' THEN 1 END) as critical_count,
+            COUNT(CASE WHEN status = 'Abnormal' THEN 1 END) as abnormal_count
+        FROM lab_results;
+    """)
+    row = cursor.fetchone()
+    conn.close()
+
+    total = row["total_reports"] or 0
+    normal = row["normal_count"] or 0
+    abnormal = total - normal
+
+    return jsonify({
+        "total_reports": total,
+        "normal_count": normal,
+        "abnormal_count": abnormal,
+        "high_count": row["high_count"] or 0,
+        "low_count": row["low_count"] or 0,
+        "critical_count": row["critical_count"] or 0
     })
 
 
