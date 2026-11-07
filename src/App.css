@@ -1,1 +1,527 @@
+/* HealthPulse SaaS Design System */
 
+:root {
+  --primary-navy: #0f172a;
+  --secondary-navy: #1e293b;
+  --primary-blue: #0284c7;
+  --primary-cyan: #06b6d4;
+  --bg-main: #f8fafc;
+  --card-border: #e2e8f0;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Dark Navy Sidebar Styling */
+.sidebar-nav {
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 4px 0 24px rgba(15, 23, 42, 0.05);
+}
+
+.sidebar-nav .nav-link {
+  color: #94a3b8;
+  font-weight: 500;
+  border-radius: 10px;
+  transition: all 0.2s ease;
+}
+
+.sidebar-nav .nav-link:hover {
+  color: #ffffff;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.sidebar-nav .nav-link.active {
+  background: #0284c7;
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(2, 132, 199, 0.3);
+}
+
+/* Sidebar Doctor / User Profile Badge */
+.sidebar-profile-card {
+  background-color: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  transition: all 0.2s ease-in-out;
+}
+
+.sidebar-profile-card:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  border-color: rgba(56, 189, 248, 0.3);
+}
+
+/* Mobile Responsive Sidebar */
+@media (max-width: 991.98px) {
+  .sidebar-nav {
+    transform: translateX(-100%);
+  }
+  .sidebar-nav.show {
+    transform: translateX(0);
+  }
+  div[style*="margin-left: 260px"] {
+    margin-left: 0 !important;
+  }
+}
+
+/* Cards & Layout */
+.card {
+  border: 1px solid var(--card-border);
+}
+
+.shadow-xs {
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+/* Subtle transitions */
+.transition-all {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.hover-bg-light:hover {
+  background-color: #f8fafc;
+}
+
+/* Pulse Animation for Live Indicators */
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.7);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 6px rgba(14, 165, 233, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(14, 165, 233, 0);
+  }
+}
+
+.animate-pulse-ring {
+  animation: pulse-ring 2s infinite;
+}
+
+/* ============================================================
+   EMR (Electronic Medical Records) Modal Styles
+   ============================================================ */
+
+.emr-modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  background-color: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(4px);
+  z-index: 1060;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.emr-modal-container {
+  width: min(1180px, calc(100vw - 32px));
+  max-width: min(1180px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  background: #ffffff;
+  border-radius: 1rem;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+  border: 1px solid rgba(226, 232, 240, 0.8);
+}
+
+.emr-modal-container *,
+.emr-modal-container *::before,
+.emr-modal-container *::after {
+  box-sizing: border-box;
+}
+
+.emr-modal-header {
+  flex: 0 0 auto;
+  background: #ffffff;
+  border-bottom: 1px solid #e2e8f0;
+  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.emr-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: 1.5rem;
+  background-color: #f8fafc;
+}
+
+.emr-modal-footer {
+  flex: 0 0 auto;
+  background: #ffffff;
+  border-top: 1px solid #e2e8f0;
+  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+/* Participants (Patient & Doctor) Responsive Grid */
+.emr-participants-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+@media (max-width: 768px) {
+  .emr-participants-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.emr-info-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+.emr-info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.83rem;
+}
+
+.emr-info-label {
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+.emr-info-value {
+  color: #0f172a;
+  text-align: right;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Vital Signs Responsive Grid */
+.emr-vitals-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+@media (max-width: 1100px) {
+  .emr-vitals-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .emr-vitals-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.emr-vital-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.65rem;
+  padding: 0.75rem 0.5rem;
+  text-align: center;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.02);
+}
+
+.emr-vital-label {
+  font-size: 0.72rem;
+  color: #64748b;
+  margin-bottom: 0.25rem;
+  overflow-wrap: break-word;
+  line-height: 1.2;
+}
+
+.emr-vital-value {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.2;
+  margin-bottom: 0.15rem;
+  overflow-wrap: anywhere;
+}
+
+.emr-vital-unit {
+  font-size: 0.68rem;
+  color: #94a3b8;
+}
+
+/* Clinical Documentation Sections */
+.emr-soap-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+@media (max-width: 768px) {
+  .emr-soap-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.emr-soap-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+  min-width: 0;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03);
+}
+
+.emr-soap-card.full-width {
+  grid-column: 1 / -1;
+}
+
+.emr-soap-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #0284c7;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.emr-soap-content {
+  font-size: 0.86rem;
+  color: #1e293b;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  margin-bottom: 0;
+}
+
+/* ============================================================
+   Upcoming Consultation Card Grid
+   ============================================================ */
+.upcoming-consultation-card {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.25rem;
+  align-items: center;
+  background-color: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 1rem;
+  padding: 1.25rem;
+  box-sizing: border-box;
+  width: 100%;
+}
+
+@media (min-width: 768px) {
+  .upcoming-consultation-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 1.5rem;
+  }
+}
+
+.upcoming-consultation-details {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.upcoming-consultation-actions {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+@media (min-width: 768px) {
+  .upcoming-consultation-actions {
+    align-items: flex-end;
+    text-align: right;
+  }
+}
+
+@media (max-width: 767.98px) {
+  .upcoming-consultation-actions {
+    border-top: 1px solid #e2e8f0;
+    padding-top: 1rem;
+  }
+}
+
+/* Print Styles for Official Prescriptions */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #rx-print-area, #rx-print-area * {
+    visibility: visible;
+  }
+  #rx-print-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 20px !important;
+    background: #ffffff !important;
+  }
+  .modal-backdrop, .modal-header, .modal-footer, header, aside, .sidebar-nav {
+    display: none !important;
+  }
+}
+
+/* ============================================================
+   Admin Reports Dashboard & Analytics Charts
+   ============================================================ */
+
+.reports-chart-card {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+}
+
+.reports-chart-container {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  position: relative;
+  box-sizing: border-box;
+}
+
+.dept-legend-container {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  max-height: 165px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
+}
+
+/* Custom scrollbar for multi-column department legend */
+.dept-legend-container::-webkit-scrollbar {
+  width: 5px;
+}
+.dept-legend-container::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+.dept-legend-container::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+.dept-legend-container::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+.dept-legend-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 12px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+@media (max-width: 1199.98px) {
+  .dept-legend-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px 10px;
+  }
+}
+
+@media (max-width: 575.98px) {
+  .dept-legend-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 8px;
+  }
+}
+
+.dept-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background-color: #f8fafc;
+  border: 1px solid #f1f5f9;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+  cursor: default;
+  box-sizing: border-box;
+}
+
+.dept-legend-item:hover {
+  background-color: #f1f5f9;
+  border-color: #e2e8f0;
+}
+
+.dept-legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dept-legend-label {
+  font-size: 0.76rem;
+  font-weight: 500;
+  color: #334155;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+
+.dept-legend-value {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #64748b;
+  flex-shrink: 0;
+}

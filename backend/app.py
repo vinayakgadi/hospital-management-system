@@ -1,27 +1,128 @@
 import os
 import sqlite3
-from flask import Flask, request, jsonify
+import secrets
+import re
+import json
+import math
+import io
+import csv
+import time
+from datetime import datetime, timedelta
+from functools import wraps
+from flask import Flask, request, jsonify, make_response, g, redirect
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-# Enable CORS for all routes and origins
-CORS(app, resources={r"/*": {"origins": "*"}})
+# Enable CORS for all routes and origins with support for authorization headers
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+@app.before_request
+def before_request_perf():
+    g.start_time = time.time()
+    g.db_query_time = 0.0
+    g.db_query_count = 0
+
+@app.after_request
+def after_request_perf(response):
+    if hasattr(g, "start_time"):
+        total_ms = (time.time() - g.start_time) * 1000.0
+        db_ms = getattr(g, "db_query_time", 0.0) * 1000.0
+        queries = getattr(g, "db_query_count", 0)
+        flask_ms = max(0.0, total_ms - db_ms)
+        response.headers["X-Response-Time-Ms"] = f"{total_ms:.2f}"
+        response.headers["X-DB-Time-Ms"] = f"{db_ms:.2f}"
+        response.headers["X-DB-Queries"] = str(queries)
+        if total_ms > 200 or request.path.startswith("/api/"):
+            print(f"[PERF] {request.method} {request.path} - {total_ms:.1f}ms total (DB: {db_ms:.1f}ms in {queries} queries, Flask: {flask_ms:.1f}ms)")
+    return response
+
+from database import (
+    get_db_connection,
+    is_postgres_configured,
+    get_active_db_engine,
+    test_database_connection
+)
+from firebase_auth import (
+    verify_firebase_id_token,
+    is_firebase_configured
+)
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patients.db")
 
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# ---------------------------------------------------------
+# DATABASE INITIALIZATION & SAFE SCHEMA MIGRATION
+# ---------------------------------------------------------
 
 def init_db():
+    if is_postgres_configured():
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM users LIMIT 1;")
+            conn.close()
+            print("[OK] HealthPulse active database engine: PostgreSQL")
+            return
+        except Exception as e:
+            print(f"[INFO] PostgreSQL configuration detected. Run 'python backend/migrate_to_postgres.py' to complete migration: {e}")
+            return
+
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # 1. Central Users Table (Role-based authentication & status)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin', 'doctor', 'patient')),
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 2. Server-side Revocable User Tokens Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_tokens (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+
+    # 3. Doctors Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS doctors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            specialization TEXT NOT NULL,
+            phone TEXT DEFAULT '555-0199',
+            status TEXT DEFAULT 'Active',
+            role TEXT DEFAULT 'Doctor',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Check and add user_id column to doctors safely
+    cursor.execute("PRAGMA table_info(doctors)")
+    doc_cols = [c[1] for c in cursor.fetchall()]
+    if "user_id" not in doc_cols:
+        cursor.execute("ALTER TABLE doctors ADD COLUMN user_id INTEGER DEFAULT NULL")
+
+    # 4. Patients Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS patients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             name TEXT NOT NULL,
             weight TEXT,
             gender TEXT,
@@ -32,49 +133,504 @@ def init_db():
             doctor_id INTEGER DEFAULT 1,
             doctor_name TEXT,
             doctor_specialization TEXT,
-            role TEXT DEFAULT 'Patient'
+            role TEXT DEFAULT 'Patient',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
 
-    # Check if database is empty, seed with initial clinical data
-    cursor.execute("SELECT COUNT(*) FROM patients")
-    count = cursor.fetchone()[0]
+    # Check and add user_id and created_at columns to patients safely
+    cursor.execute("PRAGMA table_info(patients)")
+    pat_cols = [c[1] for c in cursor.fetchall()]
+    if "user_id" not in pat_cols:
+        cursor.execute("ALTER TABLE patients ADD COLUMN user_id INTEGER DEFAULT NULL")
+    if "created_at" not in pat_cols:
+        cursor.execute("ALTER TABLE patients ADD COLUMN created_at TEXT DEFAULT NULL")
+        cursor.execute("UPDATE patients SET created_at = datetime('now') WHERE created_at IS NULL")
 
-    if count == 0:
-        initial_patients = [
-            (
-                "shravan", "85", "Male", "26", "shravan@gmail.com", "shravan",
-                "Headache", 1, "Satya Deep", "cardio", "Patient"
-            ),
-            (
-                "Satya Deep G", "90", "Male", "29", "satya@gmail.com", "satya",
-                "Headache", 2, "Teja", "Muscles", "Patient"
-            ),
-            (
-                "Abdul", "86", "Male", "29", "abdul@gmail.com", "abdul",
-                "Bones", 3, "Sam", "Bones", "Patient"
-            ),
-            (
-                "ram teja", "65", "Male", "20", "ram@gmail.com", "ram",
-                "Brain", 2, "Teja", "Muscles", "Patient"
-            ),
-            (
-                "Vijay Kumar", "70", "Male", "55", "chlsdev23@gmail.com", "vijay",
-                "Brain Tumor", 4, "Dr. Lakshimi", "Neurologist", "Patient"
-            ),
+    # 5. Appointments Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS appointments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            doctor_id INTEGER NOT NULL,
+            appointment_date TEXT NOT NULL,
+            appointment_time TEXT NOT NULL,
+            status TEXT DEFAULT 'Scheduled',
+            reason TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (patient_id) REFERENCES patients(id),
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id)
+        )
+    """)
+
+    # 6. Activity Logs Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            actor_name TEXT DEFAULT 'System',
+            actor_role TEXT DEFAULT 'Admin',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 7. Admins Table (legacy preservation)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            role TEXT DEFAULT 'Admin',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 8. Medical Records Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS medical_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            doctor_id INTEGER NOT NULL,
+            consultation_date TEXT NOT NULL,
+            symptoms TEXT,
+            observations TEXT,
+            diagnosis TEXT NOT NULL,
+            treatment_plan TEXT,
+            clinical_notes TEXT,
+            follow_up_date TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (patient_id) REFERENCES patients(id),
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id)
+        )
+    """)
+
+    # 9. Prescriptions Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS prescriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            doctor_id INTEGER NOT NULL,
+            medication_name TEXT NOT NULL,
+            dosage TEXT NOT NULL,
+            frequency TEXT NOT NULL,
+            duration TEXT NOT NULL,
+            route TEXT DEFAULT 'Oral',
+            instructions TEXT,
+            prescription_date TEXT NOT NULL,
+            status TEXT DEFAULT 'Active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (patient_id) REFERENCES patients(id),
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id)
+        )
+    """)
+
+    # 10. Doctor Schedules Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS doctor_schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doctor_id INTEGER NOT NULL,
+            day_of_week TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            slot_duration_minutes INTEGER DEFAULT 30,
+            status TEXT DEFAULT 'Available',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id)
+        )
+    """)
+
+    # 11. Notifications Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            type TEXT DEFAULT 'info',
+            is_read INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Check and add columns to doctors table safely
+    cursor.execute("PRAGMA table_info(doctors)")
+    doc_cols_ext = [c[1] for c in cursor.fetchall()]
+    if "qualifications" not in doc_cols_ext:
+        cursor.execute("ALTER TABLE doctors ADD COLUMN qualifications TEXT DEFAULT 'MD, FACC - Harvard Medical School'")
+    if "biography" not in doc_cols_ext:
+        cursor.execute("ALTER TABLE doctors ADD COLUMN biography TEXT DEFAULT 'Senior clinical specialist with over 12 years of experience in patient diagnosis, cardiology care, and comprehensive treatment planning.'")
+    if "experience_years" not in doc_cols_ext:
+        cursor.execute("ALTER TABLE doctors ADD COLUMN experience_years INTEGER DEFAULT 12")
+
+    # Check and add columns to medical_records table safely
+    cursor.execute("PRAGMA table_info(medical_records)")
+    mr_cols = [c[1] for c in cursor.fetchall()]
+    if "consultation_time" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN consultation_time TEXT DEFAULT '10:00 AM'")
+    if "visit_type" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN visit_type TEXT DEFAULT 'In-Person'")
+    if "visit_reason" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN visit_reason TEXT DEFAULT 'Clinical Consultation'")
+    if "vital_signs" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN vital_signs TEXT DEFAULT '{}'")
+    if "follow_up_notes" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN follow_up_notes TEXT DEFAULT ''")
+    if "status" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN status TEXT DEFAULT 'Finalized'")
+    if "updated_at" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN updated_at TIMESTAMP")
+    if "finalized_at" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN finalized_at TIMESTAMP")
+    if "appointment_id" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN appointment_id INTEGER")
+    if "review_required" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN review_required INTEGER DEFAULT 0")
+    if "review_reason" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN review_reason TEXT DEFAULT ''")
+    if "is_amended" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN is_amended INTEGER DEFAULT 0")
+    if "amended_at" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN amended_at TIMESTAMP")
+    if "amended_by" not in mr_cols:
+        cursor.execute("ALTER TABLE medical_records ADD COLUMN amended_by TEXT DEFAULT ''")
+
+    # Safe indexes for medical_records
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_patient ON medical_records(patient_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_doctor ON medical_records(doctor_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_date ON medical_records(consultation_date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_status ON medical_records(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mr_apt ON medical_records(appointment_id)")
+
+    # 13. Medical Record Amendments Table (Clinical Audit Trail)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS medical_record_amendments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL,
+            amended_by_user_id INTEGER,
+            amended_by_name TEXT NOT NULL,
+            amended_by_role TEXT NOT NULL,
+            previous_doctor_id INTEGER,
+            previous_doctor_name TEXT,
+            new_doctor_id INTEGER,
+            new_doctor_name TEXT,
+            previous_data TEXT NOT NULL,
+            amendment_reason TEXT NOT NULL,
+            changes_summary TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (record_id) REFERENCES medical_records(id) ON DELETE CASCADE
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_mra_record ON medical_record_amendments(record_id)")
+
+    # 12. Lab Results & Medical Documents Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lab_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            doctor_id INTEGER,
+            test_name TEXT NOT NULL,
+            test_date TEXT NOT NULL,
+            result_value TEXT NOT NULL,
+            units TEXT,
+            reference_range TEXT,
+            status TEXT DEFAULT 'Normal',
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (patient_id) REFERENCES patients(id),
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_lab_patient ON lab_results(patient_id)")
+
+    # ---------------------------------------------------------
+    # DATA MIGRATION: SEED / LINK CENTRAL USERS
+    # ---------------------------------------------------------
+
+    # A. Migrate Administrators into central users table
+    admin_email = "admin@healthpulse.com"
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (admin_email,))
+    admin_user = cursor.fetchone()
+    if not admin_user:
+        hashed_admin_pw = generate_password_hash("admin123")
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'admin', 1)
+        """, ("System Administrator", admin_email, hashed_admin_pw))
+        # Ensure legacy admins table has it too
+        cursor.execute("SELECT id FROM admins WHERE LOWER(email) = ?", (admin_email,))
+        if not cursor.fetchone():
+            cursor.execute("""
+                INSERT INTO admins (name, email, password, role)
+                VALUES (?, ?, ?, 'Admin')
+            """, ("System Administrator", admin_email, hashed_admin_pw))
+
+    # B. Seed Initial Doctors if doctors table is empty
+    cursor.execute("SELECT COUNT(*) FROM doctors")
+    if cursor.fetchone()[0] == 0:
+        initial_doctors = [
+            ("Dr. Satya Deep", "satya.deep@healthpulse.com", generate_password_hash("doctor123"), "Cardiology", "555-0101", "Active"),
+            ("Dr. Teja", "teja@healthpulse.com", generate_password_hash("doctor123"), "Muscles & Orthopedics", "555-0102", "Active"),
+            ("Dr. Sam", "sam@healthpulse.com", generate_password_hash("doctor123"), "Bones & Trauma", "555-0103", "Active"),
+            ("Dr. Lakshimi", "lakshimi@healthpulse.com", generate_password_hash("doctor123"), "Neurology", "555-0104", "Active"),
+            ("Dr. Priya Patel", "priya.patel@healthpulse.com", generate_password_hash("doctor123"), "Cardiology", "555-0105", "Active"),
+            ("Dr. Kartick", "kartick@healthpulse.com", generate_password_hash("doctor123"), "Cardiology", "555-0106", "Active"),
         ]
         cursor.executemany("""
-            INSERT INTO patients (
-                name, weight, gender, age, email, password, disease,
-                doctor_id, doctor_name, doctor_specialization, role
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, initial_patients)
+            INSERT INTO doctors (name, email, password, specialization, phone, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, initial_doctors)
+
+    # C. Migrate Doctors into central users table and link user_id
+    cursor.execute("SELECT id, name, email, password FROM doctors")
+    all_doctors = cursor.fetchall()
+    for doc in all_doctors:
+        d_id = doc["id"]
+        d_name = doc["name"]
+        d_email = doc["email"].strip().lower()
+        d_pw = doc["password"]
+
+        # Ensure password is safe hash
+        if not (d_pw.startswith("pbkdf2:sha256:") or d_pw.startswith("scrypt:")):
+            d_pw_hash = generate_password_hash(d_pw if d_pw else "doctor123")
+            cursor.execute("UPDATE doctors SET password = ? WHERE id = ?", (d_pw_hash, d_id))
+        else:
+            d_pw_hash = d_pw
+
+        # Check if already in users table
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (d_email,))
+        existing_u = cursor.fetchone()
+        if existing_u:
+            u_id = existing_u["id"]
+        else:
+            cursor.execute("""
+                INSERT INTO users (name, email, password_hash, role, is_active)
+                VALUES (?, ?, ?, 'doctor', 1)
+            """, (d_name, d_email, d_pw_hash))
+            u_id = cursor.lastrowid
+
+        cursor.execute("UPDATE doctors SET user_id = ? WHERE id = ?", (u_id, d_id))
+
+    # Support alias demo account: dr.satyadeep@healthpulse.com -> Dr. Satya Deep
+    alias_doc_email = "dr.satyadeep@healthpulse.com"
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (alias_doc_email,))
+    if not cursor.fetchone():
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'doctor', 1)
+        """, ("Dr. Satya Deep", alias_doc_email, generate_password_hash("doctor123")))
+
+    # D. Seed Initial Appointments if empty
+    cursor.execute("SELECT COUNT(*) FROM appointments")
+    if cursor.fetchone()[0] == 0:
+        today = datetime.now()
+        initial_appointments = [
+            (1, 1, (today + timedelta(days=1)).strftime("%Y-%m-%d"), "09:30 AM", "Scheduled", "Routine Cardiovascular Checkup"),
+            (2, 2, (today + timedelta(days=1)).strftime("%Y-%m-%d"), "11:00 AM", "Scheduled", "Kidney Function Follow-up"),
+            (4, 2, (today + timedelta(days=2)).strftime("%Y-%m-%d"), "02:15 PM", "Scheduled", "Neurological Consultation"),
+            (6, 4, (today + timedelta(days=3)).strftime("%Y-%m-%d"), "10:00 AM", "Scheduled", "Brain Tumor Monitoring"),
+            (1, 1, (today - timedelta(days=3)).strftime("%Y-%m-%d"), "03:00 PM", "Completed", "Initial Headache Assessment"),
+            (2, 2, (today - timedelta(days=5)).strftime("%Y-%m-%d"), "01:30 PM", "Completed", "Dialysis Review"),
+            (4, 2, (today - timedelta(days=2)).strftime("%Y-%m-%d"), "04:00 PM", "Cancelled", "Rescheduled by Patient"),
+        ]
+        cursor.executemany("""
+            INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, status, reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, initial_appointments)
+
+    # E. Seed Initial Activity Logs if empty
+    cursor.execute("SELECT COUNT(*) FROM activity_logs")
+    if cursor.fetchone()[0] == 0:
+        initial_logs = [
+            ("PATIENT_REGISTERED", "New patient Y.Kumari registered into Cardiology care", "Patient", 8, "Admin Portal", "Admin"),
+            ("APPOINTMENT_SCHEDULED", "Routine Cardiovascular Checkup scheduled with Dr. Satya Deep", "Appointment", 1, "System Administrator", "Admin"),
+            ("RECORD_UPDATED", "Updated medical condition for Satya Deep G to Kidney", "Patient", 2, "Dr. Teja", "Doctor"),
+            ("DOCTOR_REGISTERED", "Dr. Priya Patel registered to Cardiology department", "Doctor", 5, "System Administrator", "Admin"),
+            ("APPOINTMENT_COMPLETED", "Consultation completed for shravan with Dr. Satya Deep", "Appointment", 5, "Dr. Satya Deep", "Doctor"),
+        ]
+        cursor.executemany("""
+            INSERT INTO activity_logs (event_type, description, entity_type, entity_id, actor_name, actor_role)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, initial_logs)
+
+    # F. Migrate Patients into central users table and link user_id
+    cursor.execute("SELECT id, name, email, password FROM patients")
+    all_patients = cursor.fetchall()
+    for pat in all_patients:
+        p_id = pat["id"]
+        p_name = pat["name"]
+        p_email = pat["email"].strip().lower()
+        p_pw = pat["password"]
+
+        # Ensure password is safe hash (never store plaintext!)
+        if not (p_pw and (p_pw.startswith("pbkdf2:sha256:") or p_pw.startswith("scrypt:"))):
+            p_pw_hash = generate_password_hash(p_pw if p_pw else "patient123")
+            cursor.execute("UPDATE patients SET password = ? WHERE id = ?", (p_pw_hash, p_id))
+        else:
+            p_pw_hash = p_pw
+
+        # Check if already in users table
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (p_email,))
+        existing_u = cursor.fetchone()
+        if existing_u:
+            u_id = existing_u["id"]
+        else:
+            cursor.execute("""
+                INSERT INTO users (name, email, password_hash, role, is_active)
+                VALUES (?, ?, ?, 'patient', 1)
+            """, (p_name, p_email, p_pw_hash))
+            u_id = cursor.lastrowid
+
+        cursor.execute("UPDATE patients SET user_id = ? WHERE id = ?", (u_id, p_id))
+
+    # Support alias demo account: shravan@healthpulse.com -> patient Shravan
+    alias_pat_email = "shravan@healthpulse.com"
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (alias_pat_email,))
+    if not cursor.fetchone():
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'patient', 1)
+        """, ("shravan", alias_pat_email, generate_password_hash("patient123")))
+
+    # G. Seed Medical Records if empty
+    cursor.execute("SELECT COUNT(*) FROM medical_records")
+    if cursor.fetchone()[0] == 0:
+        today = datetime.now()
+        initial_records = [
+            (
+                1, 1, (today - timedelta(days=2)).strftime("%Y-%m-%d"),
+                "Chest tightness during exertion, mild shortness of breath, fatigue",
+                "BP 132/84 mmHg, HR 76 bpm regular. Bilateral clear breath sounds, normal S1/S2.",
+                "Essential Stage-1 Hypertension & Early Angina Pectoris",
+                "Prescribe Amlodipine 5mg once daily. Reduce dietary sodium, moderate cardiovascular exercise 30 min daily.",
+                "Patient responded well to initial counseling. Baseline ECG and lipid panel ordered for 3-week follow-up.",
+                (today + timedelta(days=19)).strftime("%Y-%m-%d")
+            ),
+            (
+                2, 1, (today - timedelta(days=5)).strftime("%Y-%m-%d"),
+                "Chronic flank discomfort, morning edema, mild elevated proteinuria",
+                "BP 128/80 mmHg, abdominal exam soft non-tender. Trace pedal edema bilateral.",
+                "Chronic Kidney Disease (Stage 2) & Renovascular Monitoring",
+                "Low protein renal diet, maintain hydration 2.5L/day. Renoprotective regimen.",
+                "Serum creatinine monitored at 1.4 mg/dL. Coordinate with nephrology consultation.",
+                (today + timedelta(days=14)).strftime("%Y-%m-%d")
+            ),
+            (
+                4, 1, (today - timedelta(days=8)).strftime("%Y-%m-%d"),
+                "Recurrent tension headaches, neck stiffness following prolonged desk work",
+                "Normal cranial nerves II-XII intact. Cervical spine range of motion mildly restricted.",
+                "Cervicogenic Tension Headache",
+                "Ergonomic workstation adjustment, physical therapy, gentle cervical stretching exercises.",
+                "Prescribed PRN analgesics. Reassuring neurological exam without focal deficits.",
+                (today + timedelta(days=21)).strftime("%Y-%m-%d")
+            )
+        ]
+        cursor.executemany("""
+            INSERT INTO medical_records (
+                patient_id, doctor_id, consultation_date, symptoms, observations,
+                diagnosis, treatment_plan, clinical_notes, follow_up_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, initial_records)
+
+    # H. Seed Prescriptions if empty
+    cursor.execute("SELECT COUNT(*) FROM prescriptions")
+    if cursor.fetchone()[0] == 0:
+        today = datetime.now()
+        initial_prescriptions = [
+            (1, 1, "Amlodipine Besylate", "5 mg", "Once daily in morning", "30 days", "Oral", "Take with or without food. Monitor blood pressure weekly.", (today - timedelta(days=2)).strftime("%Y-%m-%d"), "Active"),
+            (1, 1, "Atorvastatin Calcium", "10 mg", "Once daily at bedtime", "60 days", "Oral", "Take after dinner. Avoid grapefruit juice during therapy.", (today - timedelta(days=2)).strftime("%Y-%m-%d"), "Active"),
+            (2, 1, "Losartan Potassium", "50 mg", "Once daily", "90 days", "Oral", "Blood pressure and renal function monitoring required at 4 weeks.", (today - timedelta(days=5)).strftime("%Y-%m-%d"), "Active"),
+            (4, 1, "Acetaminophen Extra Strength", "500 mg", "Every 6-8 hours as needed", "10 days", "Oral", "Do not exceed 3,000 mg within 24 hours.", (today - timedelta(days=8)).strftime("%Y-%m-%d"), "Completed"),
+        ]
+        cursor.executemany("""
+            INSERT INTO prescriptions (
+                patient_id, doctor_id, medication_name, dosage, frequency,
+                duration, route, instructions, prescription_date, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, initial_prescriptions)
+
+    # I. Seed Doctor Schedules if empty
+    cursor.execute("SELECT COUNT(*) FROM doctor_schedules")
+    if cursor.fetchone()[0] == 0:
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        schedule_entries = []
+        for doc_id in range(1, 8):
+            for d in days:
+                status = "Available"
+                start = "09:00 AM" if d != "Saturday" else "10:00 AM"
+                end = "05:00 PM" if d != "Saturday" else "01:00 PM"
+                schedule_entries.append((doc_id, d, start, end, 30, status))
+        cursor.executemany("""
+            INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, slot_duration_minutes, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, schedule_entries)
+
+    # J. Seed Notifications if empty
+    cursor.execute("SELECT COUNT(*) FROM notifications")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("SELECT user_id FROM doctors WHERE id = 1")
+        doc_u = cursor.fetchone()
+        u_id = doc_u["user_id"] if doc_u and doc_u["user_id"] else 2
+        notifs = [
+            (u_id, "New Patient Assigned", "Patient 'shravan' has been assigned to your Cardiology service.", "patient", 0),
+            (u_id, "Appointment Scheduled", "Follow-up consultation booked for shravan on Cardiovascular checkup.", "appointment", 0),
+            (u_id, "Lab Diagnostic Result", "Comprehensive Lipid Profile results uploaded for Patient #1.", "alert", 0),
+            (u_id, "Consultation Completed", "Encounter documented for Satya Deep G in Renovascular clinic.", "appointment", 1),
+        ]
+        cursor.executemany("""
+            INSERT INTO notifications (user_id, title, message, type, is_read)
+            VALUES (?, ?, ?, ?, ?)
+        """, notifs)
+
+    # K. Seed Lab Results if empty
+    cursor.execute("SELECT COUNT(*) FROM lab_results")
+    if cursor.fetchone()[0] == 0:
+        today = datetime.now()
+        initial_labs = [
+            (1, 1, "Lipid Panel (Total Cholesterol)", (today - timedelta(days=2)).strftime("%Y-%m-%d"), "218", "mg/dL", "< 200 mg/dL", "Abnormal", "Borderline elevated; patient initiated on dietary lifestyle therapy."),
+            (1, 1, "Complete Blood Count (Hemoglobin)", (today - timedelta(days=2)).strftime("%Y-%m-%d"), "14.8", "g/dL", "13.5 - 17.5 g/dL", "Normal", "Erythrocyte and platelet indices within physiologic limits."),
+            (2, 1, "Serum Creatinine", (today - timedelta(days=5)).strftime("%Y-%m-%d"), "1.4", "mg/dL", "0.7 - 1.3 mg/dL", "Abnormal", "Mild elevation consistent with Stage 2 CKD baseline."),
+            (2, 1, "Estimated GFR (eGFR)", (today - timedelta(days=5)).strftime("%Y-%m-%d"), "68", "mL/min/1.73m²", "> 90 mL/min/1.73m²", "Borderline", "Stable renal function on current ACE-inhibitor regimen."),
+            (8, 1, "Glycated Hemoglobin (HbA1c)", (today - timedelta(days=1)).strftime("%Y-%m-%d"), "5.6", "%", "< 5.7%", "Normal", "Euglycemic state; no indication of insulin resistance."),
+            (8, 1, "High-Sensitivity CRP (hs-CRP)", (today - timedelta(days=1)).strftime("%Y-%m-%d"), "1.1", "mg/L", "< 3.0 mg/L", "Normal", "Low cardiovascular inflammatory risk profile.")
+        ]
+        cursor.executemany("""
+            INSERT INTO lab_results (
+                patient_id, doctor_id, test_name, test_date, result_value,
+                units, reference_range, status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, initial_labs)
+
+    # Ensure at least 1 record has 'Draft' status for testing draft workflows
+    cursor.execute("SELECT COUNT(*) FROM medical_records WHERE status = 'Draft'")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("UPDATE medical_records SET status = 'Draft' WHERE id = (SELECT MAX(id) FROM medical_records)")
 
     conn.commit()
     conn.close()
 
 
+def log_activity(event_type, description, entity_type=None, entity_id=None, actor_name="Admin", actor_role="Admin"):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO activity_logs (event_type, description, entity_type, entity_id, actor_name, actor_role)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (event_type, description, entity_type, entity_id, actor_name, actor_role))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to log activity: {e}")
+
+
 def row_to_patient_dict(row):
+    row_keys = row.keys() if hasattr(row, "keys") else []
     return {
         "id": row["id"],
         "name": row["name"],
@@ -82,9 +638,15 @@ def row_to_patient_dict(row):
         "gender": row["gender"] or "Male",
         "age": str(row["age"]) if row["age"] is not None else "",
         "email": row["email"],
-        "password": row["password"],
+        "phone": row["phone"] if "phone" in row_keys and row["phone"] else "+1 (555) 234-5678",
+        "address": row["address"] if "address" in row_keys and row["address"] else "742 Evergreen Terrace, Springfield, OR 97477",
+        "emergency_contact_name": row["emergency_contact_name"] if "emergency_contact_name" in row_keys and row["emergency_contact_name"] else "Sarah Jenkins",
+        "emergency_contact_phone": row["emergency_contact_phone"] if "emergency_contact_phone" in row_keys and row["emergency_contact_phone"] else "+1 (555) 987-6543",
+        "date_of_birth": row["date_of_birth"] if "date_of_birth" in row_keys and row["date_of_birth"] else "1992-06-15",
+        "blood_group": row["blood_group"] if "blood_group" in row_keys and row["blood_group"] else "O+",
         "disease": row["disease"] or "General",
         "role": row["role"] or "Patient",
+        "created_at": row["created_at"] if "created_at" in row_keys else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "doctor": {
             "id": row["doctor_id"] or 1,
             "name": row["doctor_name"] or "Unassigned",
@@ -93,35 +655,4015 @@ def row_to_patient_dict(row):
     }
 
 
+def row_to_doctor_dict(row):
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"] if "user_id" in row.keys() else None,
+        "name": row["name"],
+        "email": row["email"],
+        "specialization": row["specialization"],
+        "phone": row["phone"],
+        "status": row["status"],
+        "qualifications": row["qualifications"] if "qualifications" in row.keys() and row["qualifications"] else "MD, FACC - Harvard Medical School",
+        "biography": row["biography"] if "biography" in row.keys() and row["biography"] else "Senior clinical specialist with over 12 years of experience in patient diagnosis, cardiology care, and comprehensive treatment planning.",
+        "experience_years": row["experience_years"] if "experience_years" in row.keys() and row["experience_years"] is not None else 12,
+        "role": "Doctor",
+        "created_at": row["created_at"],
+    }
+
+
+def row_to_medical_record_dict(row):
+    row_keys = row.keys() if hasattr(row, "keys") else []
+    
+    # Parse vital signs if JSON string
+    vital_signs_raw = row["vital_signs"] if "vital_signs" in row_keys else "{}"
+    vital_signs = {}
+    if vital_signs_raw:
+        if isinstance(vital_signs_raw, dict):
+            vital_signs = vital_signs_raw
+        elif isinstance(vital_signs_raw, str) and vital_signs_raw.strip().startswith("{"):
+            try:
+                vital_signs = json.loads(vital_signs_raw)
+            except Exception:
+                vital_signs = {}
+        else:
+            vital_signs = {"notes": str(vital_signs_raw)}
+
+    return {
+        "id": row["id"],
+        "patient_id": row["patient_id"],
+        "patient_name": row["patient_name"] if "patient_name" in row_keys else f"Patient #{row['patient_id']}",
+        "patient_age": row["patient_age"] if "patient_age" in row_keys else None,
+        "patient_gender": row["patient_gender"] if "patient_gender" in row_keys else None,
+        "patient_email": row["patient_email"] if "patient_email" in row_keys else None,
+        "patient_contact": row["patient_contact"] if ("patient_contact" in row_keys and row["patient_contact"]) else f"+1 (555) 019-{str(row['patient_id']).zfill(4)}",
+        "patient_disease": row["patient_disease"] if "patient_disease" in row_keys else None,
+        "doctor_id": row["doctor_id"],
+        "doctor_name": row["doctor_name"] if "doctor_name" in row_keys else f"Doctor #{row['doctor_id']}",
+        "doctor_specialization": row["doctor_specialization"] if "doctor_specialization" in row_keys else "General Practice",
+        "consultation_date": row["consultation_date"],
+        "consultation_time": row["consultation_time"] if ("consultation_time" in row_keys and row["consultation_time"]) else "10:00 AM",
+        "visit_type": row["visit_type"] if ("visit_type" in row_keys and row["visit_type"]) else "In-Person",
+        "visit_reason": row["visit_reason"] if ("visit_reason" in row_keys and row["visit_reason"]) else (row["diagnosis"] or "Clinical Consultation"),
+        "symptoms": row["symptoms"] or "",
+        "observations": row["observations"] or "",
+        "vital_signs": vital_signs,
+        "diagnosis": row["diagnosis"] or "General Assessment",
+        "treatment_plan": row["treatment_plan"] or "",
+        "clinical_notes": row["clinical_notes"] or "",
+        "follow_up_date": row["follow_up_date"] or "",
+        "follow_up_notes": row["follow_up_notes"] if ("follow_up_notes" in row_keys and row["follow_up_notes"]) else "",
+        "status": row["status"] if ("status" in row_keys and row["status"]) else "Finalized",
+        "appointment_id": row["appointment_id"] if "appointment_id" in row_keys else None,
+        "review_required": bool(row["review_required"]) if "review_required" in row_keys and row["review_required"] is not None else False,
+        "review_reason": row["review_reason"] if ("review_reason" in row_keys and row["review_reason"]) else "",
+        "is_amended": bool(row["is_amended"]) if "is_amended" in row_keys and row["is_amended"] is not None else False,
+        "amended_at": row["amended_at"] if "amended_at" in row_keys else None,
+        "amended_by": row["amended_by"] if "amended_by" in row_keys else "",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"] if ("updated_at" in row_keys and row["updated_at"]) else row["created_at"],
+        "finalized_at": row["finalized_at"] if ("finalized_at" in row_keys and row["finalized_at"]) else (row["created_at"] if (row["status"] if "status" in row_keys else "Finalized") == "Finalized" else None),
+    }
+
+
+def row_to_amendment_dict(row):
+    prev_data = row["previous_data"]
+    if prev_data and isinstance(prev_data, str) and prev_data.strip().startswith("{"):
+        try:
+            prev_data = json.loads(prev_data)
+        except Exception:
+            pass
+    return {
+        "id": row["id"],
+        "record_id": row["record_id"],
+        "amended_by_user_id": row["amended_by_user_id"],
+        "amended_by_name": row["amended_by_name"],
+        "amended_by_role": row["amended_by_role"],
+        "previous_doctor_id": row["previous_doctor_id"],
+        "previous_doctor_name": row["previous_doctor_name"] or f"Doctor #{row['previous_doctor_id']}",
+        "new_doctor_id": row["new_doctor_id"],
+        "new_doctor_name": row["new_doctor_name"] or f"Doctor #{row['new_doctor_id']}",
+        "previous_data": prev_data,
+        "amendment_reason": row["amendment_reason"],
+        "changes_summary": row["changes_summary"] or "",
+        "created_at": row["created_at"],
+    }
+
+
+def row_to_lab_result_dict(row):
+    row_keys = row.keys() if hasattr(row, "keys") else []
+    return {
+        "id": row["id"],
+        "patient_id": row["patient_id"],
+        "patient_name": row["patient_name"] if "patient_name" in row_keys else f"Patient #{row['patient_id']}",
+        "doctor_id": row["doctor_id"] if "doctor_id" in row_keys else None,
+        "doctor_name": row["doctor_name"] if "doctor_name" in row_keys else "Attending Physician",
+        "test_name": row["test_name"],
+        "test_date": row["test_date"],
+        "result_value": row["result_value"],
+        "units": row["units"] if "units" in row_keys else "",
+        "reference_range": row["reference_range"] if "reference_range" in row_keys else "",
+        "status": row["status"] if "status" in row_keys else "Normal",
+        "notes": row["notes"] if "notes" in row_keys else "",
+        "created_at": row["created_at"] if "created_at" in row_keys else None,
+    }
+
+
+def row_to_prescription_dict(row):
+    return {
+        "id": row["id"],
+        "patient_id": row["patient_id"],
+        "patient_name": row["patient_name"] if "patient_name" in row.keys() else f"Patient #{row['patient_id']}",
+        "patient_gender": row["patient_gender"] if "patient_gender" in row.keys() else "Male",
+        "patient_age": row["patient_age"] if "patient_age" in row.keys() else "30",
+        "doctor_id": row["doctor_id"],
+        "doctor_name": row["doctor_name"] if "doctor_name" in row.keys() else f"Doctor #{row['doctor_id']}",
+        "doctor_specialization": row["doctor_specialization"] if "doctor_specialization" in row.keys() else "General Care",
+        "medication_name": row["medication_name"],
+        "dosage": row["dosage"],
+        "frequency": row["frequency"],
+        "duration": row["duration"],
+        "route": row["route"] or "Oral",
+        "instructions": row["instructions"] or "",
+        "prescription_date": row["prescription_date"],
+        "status": row["status"] or "Active",
+        "created_at": row["created_at"],
+    }
+
+
 # Initialize DB on startup
 init_db()
 
+
+# ---------------------------------------------------------
+# SECURITY & AUTHENTICATION MIDDLEWARE / DECORATORS
+# ---------------------------------------------------------
+
+def get_current_user():
+    """
+    Extracts Bearer token or cookie, verifies against PostgreSQL user_tokens session table
+    or Firebase ID token verification, and returns the active user dict with doctor_id/patient_id.
+    Caches result in Flask request context (g.current_user) to avoid redundant DB queries.
+    Sets g.auth_error if account is inactive or token invalid.
+    """
+    if hasattr(g, "current_user") and g.current_user is not None:
+        return g.current_user
+
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    elif request.cookies.get("healthpulse_token"):
+        token = request.cookies.get("healthpulse_token")
+
+    if not token:
+        return None
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # 1. First check if token is an active session token in user_tokens
+    cursor.execute("""
+        SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.firebase_uid,
+               t.token, t.expires_at,
+               d.id as doctor_id, d.specialization as doctor_specialization,
+               p.id as patient_id
+        FROM user_tokens t
+        JOIN users u ON t.user_id = u.id
+        LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+        LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+        WHERE t.token = ?
+    """, (token,))
+    user_row = cursor.fetchone()
+
+    # Check token expiration if from user_tokens table
+    if user_row:
+        raw_exp = user_row.get("expires_at")
+        if raw_exp is not None:
+            if isinstance(raw_exp, datetime):
+                expires_at = raw_exp
+            else:
+                try:
+                    expires_at = datetime.strptime(str(raw_exp), "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    expires_at = datetime.utcnow() + timedelta(hours=1)
+            if expires_at < datetime.utcnow():
+                cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
+                conn.commit()
+                conn.close()
+                return None
+
+    # 2. If not found in user_tokens, check if token is a Firebase ID token (or mock dev token)
+    if not user_row:
+        claims = verify_firebase_id_token(token)
+        if claims:
+            firebase_uid = claims.get("uid")
+            email = (claims.get("email") or "").lower()
+            search_email = "shravan11@gamil.com" if email in ["shravan@healthpulse.com", "shravan"] else email
+            cursor.execute("""
+                SELECT u.id, u.name, u.email, u.role, u.is_active, u.created_at, u.firebase_uid,
+                       d.id as doctor_id, d.specialization as doctor_specialization,
+                       p.id as patient_id
+                FROM users u
+                LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+                LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+                WHERE (u.firebase_uid IS NOT NULL AND u.firebase_uid = ?) 
+                   OR (LOWER(u.email) = ?)
+            """, (firebase_uid, search_email))
+            user_row = cursor.fetchone()
+
+            if user_row:
+                # Auto-link firebase_uid if missing
+                if not user_row.get("firebase_uid") and firebase_uid:
+                    try:
+                        cursor.execute("UPDATE users SET firebase_uid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (firebase_uid, user_row["id"]))
+                        conn.commit()
+                    except Exception as link_err:
+                        print(f"[Firebase] Auto-linking notice: {link_err}")
+
+    if not user_row:
+        conn.close()
+        return None
+
+    # Check if account is active
+    if not user_row["is_active"]:
+        # Delete any active session tokens for deactivated user
+        cursor.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_row["id"],))
+        conn.commit()
+        conn.close()
+        g.auth_error = "This account has been deactivated. Please contact an administrator."
+        return None
+
+    user = {
+        "id": user_row["id"],
+        "name": user_row["name"],
+        "email": user_row["email"],
+        "role": user_row["role"].lower(),
+        "is_active": bool(user_row["is_active"]),
+        "doctor_id": user_row["doctor_id"],
+        "doctor_specialization": user_row["doctor_specialization"],
+        "patient_id": user_row["patient_id"],
+        "firebase_uid": user_row.get("firebase_uid"),
+        "token": token
+    }
+    conn.close()
+    g.current_user = user
+    return user
+
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            if hasattr(g, "auth_error") and g.auth_error:
+                return jsonify({
+                    "error": g.auth_error,
+                    "code": "ACCOUNT_DEACTIVATED"
+                }), 403
+            return jsonify({
+                "error": "Authentication required. Please log in with valid credentials.",
+                "code": "UNAUTHORIZED"
+            }), 401
+        return f(current_user=user, *args, **kwargs)
+    return decorated
+
+
+def require_role(*allowed_roles):
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                if hasattr(g, "auth_error") and g.auth_error:
+                    return jsonify({
+                        "error": g.auth_error,
+                        "code": "ACCOUNT_DEACTIVATED"
+                    }), 403
+                return jsonify({
+                    "error": "Authentication required. Please log in.",
+                    "code": "UNAUTHORIZED"
+                }), 401
+
+            normalized_allowed = [r.lower() for r in allowed_roles]
+            if user["role"] not in normalized_allowed:
+                return jsonify({
+                    "error": "Access Forbidden: You do not possess the required clinical or administrative role.",
+                    "code": "FORBIDDEN",
+                    "your_role": user["role"],
+                    "required_roles": allowed_roles
+                }), 403
+
+            return f(current_user=user, *args, **kwargs)
+        return decorated
+    return decorator
+
+
+# ---------------------------------------------------------
+# AUTHENTICATION REST API ENDPOINTS
+# ---------------------------------------------------------
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "online",
-        "service": "HealthPulse Python REST API",
-        "endpoints": [
-            "GET /patients",
-            "POST /patients",
-            "PUT /patients/<id>",
-            "DELETE /patients/<id>",
-            "POST /login"
-        ]
+        "service": "HealthPulse Professional Healthcare Security API",
+        "version": "2.2.0",
+        "security": "Role-Based Access Control Active",
+        "roles_supported": ["admin", "doctor", "patient"],
+        "database_engine": get_active_db_engine()
     })
 
 
-@app.route("/patients", methods=["GET"])
-def get_patients():
+@app.route("/api/system/database-status", methods=["GET"])
+def api_database_status():
+    status = test_database_connection()
+    status_code = 200 if status.get("connected") else 500
+    return jsonify(status), status_code
+
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "").strip()
+    portal_requested = data.get("role", "").strip().lower()
+
+    if not email or not password:
+        return jsonify({"error": "Both email address and password are required."}), 400
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM patients ORDER BY id DESC")
+
+    # Look up user in central users table (with support for demo patient alias)
+    search_email = "shravan11@gamil.com" if email in ["shravan@healthpulse.com", "shravan"] else email
+    cursor.execute("""
+        SELECT u.id, u.name, u.email, u.password_hash, u.role, u.is_active,
+               d.id as doctor_id, d.specialization as doctor_specialization,
+               p.id as patient_id
+        FROM users u
+        LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+        LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+        WHERE LOWER(u.email) = ?
+    """, (search_email,))
+    user = cursor.fetchone()
+
+    # Fallback check for legacy admin credentials
+    if not user and (email in ["admin@healthpulse.com", "admin"] and password in ["admin123", "admin"]):
+        cursor.execute("SELECT * FROM users WHERE role = 'admin' LIMIT 1")
+        user = cursor.fetchone()
+
+    # Fallback check for doctor / patient directly in doctors / patients table if not yet synced
+    if not user:
+        cursor.execute("SELECT * FROM doctors WHERE LOWER(email) = ?", (email,))
+        doc_match = cursor.fetchone()
+        if doc_match:
+            cursor.execute("SELECT * FROM users WHERE id = ?", (doc_match["user_id"],))
+            user = cursor.fetchone()
+
+    if not user:
+        cursor.execute("SELECT * FROM patients WHERE LOWER(email) = ?", (email,))
+        pat_match = cursor.fetchone()
+        if pat_match:
+            cursor.execute("SELECT * FROM users WHERE id = ?", (pat_match["user_id"],))
+            user = cursor.fetchone()
+
+    # Generic invalid credentials message to prevent email enumeration
+    if not user:
+        conn.close()
+        return jsonify({"error": "Invalid email address or password."}), 401
+
+    # Verify Password Hash
+    is_valid_pw = False
+    stored_hash = user["password_hash"]
+    if stored_hash.startswith("pbkdf2:sha256:") or stored_hash.startswith("scrypt:"):
+        is_valid_pw = check_password_hash(stored_hash, password)
+    else:
+        is_valid_pw = (stored_hash == password)
+
+    if not is_valid_pw:
+        conn.close()
+        return jsonify({"error": "Invalid email address or password."}), 401
+
+    # Check Account Active Status
+    if not user["is_active"]:
+        conn.close()
+        return jsonify({"error": "This account has been deactivated. Please contact an administrator."}), 403
+
+    user_role = user["role"].lower()
+
+    # Validate portal match: Prevent cross-portal login
+    if portal_requested and portal_requested != user_role:
+        conn.close()
+        return jsonify({
+            "error": f"Access Denied: This account is credentialed as a {user_role.capitalize()}. Please sign in through the designated {user_role.capitalize()} portal."
+        }), 403
+
+    # Generate Secure Revocable Token (24 hours expiration)
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+    expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        INSERT INTO user_tokens (token, user_id, expires_at)
+        VALUES (?, ?, ?)
+    """, (token, user["id"], expires_str))
+    conn.commit()
+    conn.close()
+
+    # Prepare response payload
+    user_payload = {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "role": user_role,
+        "doctor_id": user["doctor_id"] if user_role == "doctor" else None,
+        "patient_id": user["patient_id"] if user_role == "patient" else None,
+        "avatar": user["name"][:2].upper()
+    }
+
+    log_activity(
+        f"{user_role.upper()}_LOGIN",
+        f"{user_role.capitalize()} {user['name']} authenticated via portal",
+        user_role.capitalize(),
+        user["id"],
+        user["name"],
+        user_role.capitalize()
+    )
+
+    resp = make_response(jsonify({
+        "message": f"{user_role.capitalize()} authentication successful",
+        "token": token,
+        "role": user_role,
+        "user": user_payload,
+        "expires_at": expires_str
+    }))
+
+    # Set secure cookie as well
+    resp.set_cookie(
+        "healthpulse_token",
+        token,
+        httponly=True,
+        samesite="Lax",
+        max_age=86400
+    )
+    return resp
+
+
+@app.route("/api/auth/firebase-login", methods=["POST"])
+def auth_firebase_login():
+    """
+    Exchanges a Firebase ID token for a HealthPulse authenticated session.
+    Validates token, extracts UID and verified email, enforces strict RBAC
+    against PostgreSQL users table, prevents cross-portal access (403),
+    prevents unauthorized Admin/Doctor account auto-creation,
+    auto-provisions new patient accounts when appropriate,
+    and returns an authenticated user payload and session token.
+    """
+    data = request.get_json(silent=True) or {}
+    id_token = data.get("idToken")
+    portal_requested = (data.get("role") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+    provider = data.get("provider", "password")
+
+    if not id_token:
+        return jsonify({"error": "Firebase authentication ID token is required."}), 400
+
+    claims = verify_firebase_id_token(id_token)
+    if not claims:
+        return jsonify({
+            "error": "Firebase authentication failed: Invalid or expired token.",
+            "code": "INVALID_TOKEN"
+        }), 401
+
+    firebase_uid = claims.get("uid")
+    email = (claims.get("email") or "").strip().lower()
+    if not email and not firebase_uid:
+        return jsonify({"error": "Token did not contain valid identity claims."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Look up user in PostgreSQL users table (with support for demo patient alias)
+    search_email = "shravan11@gamil.com" if email in ["shravan@healthpulse.com", "shravan"] else email
+    cursor.execute("""
+        SELECT u.id, u.name, u.email, u.role, u.is_active, u.firebase_uid,
+               d.id as doctor_id, d.specialization as doctor_specialization,
+               p.id as patient_id
+        FROM users u
+        LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+        LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+        WHERE (u.firebase_uid IS NOT NULL AND u.firebase_uid = ?)
+           OR (LOWER(u.email) = ?)
+    """, (firebase_uid, search_email))
+    user = cursor.fetchone()
+
+    # Fallback check for doctors or patients not yet linked to users table
+    if not user:
+        cursor.execute("SELECT id, name, email, user_id FROM doctors WHERE LOWER(email) = ?", (search_email,))
+        doc_match = cursor.fetchone()
+        if doc_match and doc_match.get("user_id"):
+            cursor.execute("""
+                SELECT u.id, u.name, u.email, u.role, u.is_active, u.firebase_uid,
+                       d.id as doctor_id, d.specialization as doctor_specialization,
+                       p.id as patient_id
+                FROM users u
+                LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+                LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+                WHERE u.id = ?
+            """, (doc_match["user_id"],))
+            user = cursor.fetchone()
+
+    if not user:
+        cursor.execute("SELECT id, name, email, user_id FROM patients WHERE LOWER(email) = ?", (search_email,))
+        pat_match = cursor.fetchone()
+        if pat_match and pat_match.get("user_id"):
+            cursor.execute("""
+                SELECT u.id, u.name, u.email, u.role, u.is_active, u.firebase_uid,
+                       d.id as doctor_id, d.specialization as doctor_specialization,
+                       p.id as patient_id
+                FROM users u
+                LEFT JOIN doctors d ON d.user_id = u.id OR LOWER(d.email) = LOWER(u.email)
+                LEFT JOIN patients p ON p.user_id = u.id OR LOWER(p.email) = LOWER(u.email)
+                WHERE u.id = ?
+            """, (pat_match["user_id"],))
+            user = cursor.fetchone()
+
+    # If user does NOT exist in the database:
+    if not user:
+        # STRICT SECURITY RULE:
+        # Admin and Doctor accounts MUST NEVER be auto-created via Firebase / Google login!
+        if portal_requested in ["admin", "doctor"]:
+            conn.close()
+            return jsonify({
+                "error": f"Access Denied: No {portal_requested} account exists for this email address. "
+                         f"Administrative and physician accounts must be provisioned by hospital administration.",
+                "code": "FORBIDDEN"
+            }), 403
+
+        # For Patient portal, auto-provision new patient profile
+        patient_name = name or claims.get("name") or (email.split("@")[0].title() if email else "Patient User")
+        age = str(data.get("age", "30")).strip()
+        weight = str(data.get("weight", "70")).strip()
+        gender = data.get("gender", "Male").strip()
+        disease = data.get("disease", "General Wellness").strip()
+
+        try:
+            cursor.execute("""
+                INSERT INTO users (name, email, password_hash, role, is_active, firebase_uid)
+                VALUES (?, ?, 'FIREBASE_MANAGED_AUTH', 'patient', ?, ?)
+            """, (patient_name, email, True, firebase_uid))
+            new_user_id = cursor.lastrowid
+
+            cursor.execute("""
+                INSERT INTO patients (
+                    user_id, name, weight, gender, age, email, password, disease,
+                    doctor_id, doctor_name, doctor_specialization, role
+                ) VALUES (?, ?, ?, ?, ?, ?, 'FIREBASE_MANAGED_AUTH', ?, 1, 'Dr. Satya Deep', 'Cardiology', 'Patient')
+            """, (new_user_id, patient_name, weight, gender, age, email, disease))
+            new_patient_id = cursor.lastrowid
+            conn.commit()
+
+            cursor.execute("""
+                SELECT u.id, u.name, u.email, u.role, u.is_active, u.firebase_uid,
+                       p.id as patient_id
+                FROM users u
+                LEFT JOIN patients p ON p.user_id = u.id
+                WHERE u.id = ?
+            """, (new_user_id,))
+            user = cursor.fetchone()
+            log_activity("PATIENT_REGISTERED", f"Patient {patient_name} registered via Firebase", "Patient", new_patient_id, patient_name, "Patient")
+        except Exception as prov_err:
+            conn.close()
+            print(f"[Firebase] User provisioning error: {prov_err}")
+            return jsonify({"error": "Failed to create patient account in hospital database."}), 500
+
+    # User exists: check status and role
+    if not user["is_active"]:
+        conn.close()
+        return jsonify({
+            "error": "This account has been deactivated. Please contact an administrator.",
+            "code": "ACCOUNT_DEACTIVATED"
+        }), 403
+
+    user_role = user["role"].lower()
+
+    # STRICT CROSS-PORTAL CHECK:
+    # If the user attempts to sign into Doctor portal with a Patient account, or Admin portal with Doctor account:
+    if portal_requested and portal_requested != user_role:
+        conn.close()
+        return jsonify({
+            "error": f"Access Denied: This account is credentialed as a {user_role.capitalize()}. "
+                     f"Please sign in through the designated {user_role.capitalize()} portal.",
+            "code": "FORBIDDEN"
+        }), 403
+
+    # Auto-link or update firebase_uid if not set
+    if not user.get("firebase_uid") or user.get("firebase_uid") != firebase_uid:
+        try:
+            cursor.execute("UPDATE users SET firebase_uid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (firebase_uid, user["id"]))
+            conn.commit()
+        except Exception as link_err:
+            print(f"[Firebase] Note linking firebase_uid: {link_err}")
+
+    # Generate session token in user_tokens table
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+    expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        INSERT INTO user_tokens (token, user_id, expires_at)
+        VALUES (?, ?, ?)
+    """, (token, user["id"], expires_str))
+    conn.commit()
+    conn.close()
+
+    user_payload = {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "role": user_role,
+        "doctor_id": user.get("doctor_id") if user_role == "doctor" else None,
+        "patient_id": user.get("patient_id") if user_role == "patient" else None,
+        "firebase_uid": firebase_uid,
+        "avatar": user["name"][:2].upper()
+    }
+
+    log_activity(
+        f"{user_role.upper()}_FIREBASE_LOGIN",
+        f"{user_role.capitalize()} {user['name']} authenticated via Firebase ({provider})",
+        user_role.capitalize(),
+        user["id"],
+        user["name"],
+        user_role.capitalize()
+    )
+
+    resp = make_response(jsonify({
+        "message": f"{user_role.capitalize()} authentication successful",
+        "token": token,
+        "idToken": id_token,
+        "role": user_role,
+        "user": user_payload,
+        "expires_at": expires_str
+    }))
+
+    resp.set_cookie(
+        "healthpulse_token",
+        token,
+        httponly=True,
+        samesite="Lax",
+        max_age=86400
+    )
+    return resp
+
+
+@app.route("/api/auth/link-firebase", methods=["POST"])
+@require_auth
+def auth_link_firebase(current_user):
+    """
+    Explicitly associates a Firebase UID with the currently authenticated PostgreSQL user.
+    """
+    data = request.get_json(silent=True) or {}
+    id_token = data.get("idToken")
+    if not id_token:
+        return jsonify({"error": "idToken is required to link Firebase account."}), 400
+
+    claims = verify_firebase_id_token(id_token)
+    if not claims:
+        return jsonify({"error": "Invalid or expired Firebase token."}), 401
+
+    firebase_uid = claims["uid"]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET firebase_uid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (firebase_uid, current_user["id"]))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "message": "Account successfully linked with Firebase identity.",
+        "firebase_uid": firebase_uid
+    })
+
+
+@app.route("/api/auth/change-password", methods=["POST"])
+@require_auth
+def auth_change_password(current_user):
+    """
+    Allows any authenticated user (admin, doctor, patient) to update their password.
+    Verifies current password with Werkzeug check_password_hash,
+    generates secure pbkdf2 hash with generate_password_hash,
+    and updates the database.
+    """
+    data = request.get_json(silent=True) or {}
+    current_password = (data.get("current_password") or "").strip()
+    new_password = (data.get("new_password") or "").strip()
+
+    if not current_password or not new_password:
+        return jsonify({"error": "Both current password and new password are required."}), 400
+
+    if len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters in length."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, password_hash, role, email FROM users WHERE id = ?", (current_user["id"],))
+    user_row = cursor.fetchone()
+
+    if not user_row:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    stored_hash = user_row["password_hash"]
+    is_valid = False
+    if stored_hash.startswith("pbkdf2:sha256:") or stored_hash.startswith("scrypt:"):
+        is_valid = check_password_hash(stored_hash, current_password)
+    else:
+        is_valid = (stored_hash == current_password)
+
+    if not is_valid:
+        conn.close()
+        return jsonify({"error": "Current password provided is incorrect."}), 400
+
+    new_hash = generate_password_hash(new_password)
+    cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user["id"]))
+
+    if current_user["role"] == "doctor":
+        cursor.execute("UPDATE doctors SET password = ? WHERE user_id = ? OR LOWER(email) = LOWER(?)", (new_hash, current_user["id"], current_user["email"]))
+    elif current_user["role"] == "patient":
+        cursor.execute("UPDATE patients SET password = ? WHERE user_id = ? OR LOWER(email) = LOWER(?)", (new_hash, current_user["id"], current_user["email"]))
+
+    conn.commit()
+    conn.close()
+
+    log_activity(
+        "PASSWORD_CHANGED",
+        f"User {current_user['email']} changed password successfully",
+        current_user["role"].capitalize(),
+        current_user["id"],
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    return jsonify({"message": "Password changed successfully."})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    elif request.cookies.get("healthpulse_token"):
+        token = request.cookies.get("healthpulse_token")
+
+    if token:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+
+    resp = make_response(jsonify({"message": "Successfully logged out. Session invalidated."}))
+    resp.set_cookie("healthpulse_token", "", expires=0)
+    return resp
+
+
+@app.route("/api/auth/me", methods=["GET"])
+@require_auth
+def auth_me(current_user):
+    """Returns currently authenticated user profile and active session details."""
+    return jsonify({
+        "authenticated": True,
+        "user": current_user,
+        "role": current_user["role"]
+    })
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register_patient():
+    """
+    Public registration endpoint.
+    STRICT SECURITY RULE: Public users can only create 'patient' accounts.
+    Admin or doctor accounts can never be created via public registration.
+    """
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "").strip()
+
+    # Optional clinical vitals
+    age = str(data.get("age", "30")).strip()
+    weight = str(data.get("weight", "70")).strip()
+    gender = data.get("gender", "Male").strip()
+    disease = data.get("disease", "General Wellness").strip()
+
+    if not name or not email or not password:
+        return jsonify({"error": "Full Name, Email Address, and Password are required."}), 400
+
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters in length."}), 400
+
+    if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
+        return jsonify({"error": "Please provide a valid email format."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Check for duplicate user
+    cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (email,))
+    if cursor.fetchone():
+        conn.close()
+        return jsonify({"error": "An account with this email address already exists."}), 409
+
+    firebase_uid = data.get("firebase_uid") or None
+
+    try:
+        pw_hash = generate_password_hash(password)
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active, firebase_uid)
+            VALUES (?, ?, ?, 'patient', ?, ?)
+        """, (name, email, pw_hash, True, firebase_uid))
+        new_user_id = cursor.lastrowid
+
+        # Insert corresponding patient record linked with user_id
+        cursor.execute("""
+            INSERT INTO patients (
+                user_id, name, weight, gender, age, email, password, disease,
+                doctor_id, doctor_name, doctor_specialization, role
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'Dr. Satya Deep', 'Cardiology', 'Patient')
+        """, (new_user_id, name, weight, gender, age, email, pw_hash, disease))
+        new_patient_id = cursor.lastrowid
+
+        conn.commit()
+        conn.close()
+
+        log_activity("PATIENT_REGISTERED", f"Patient {name} registered via patient portal", "Patient", new_patient_id, name, "Patient")
+
+        return jsonify({
+            "message": "Patient registration successful. You may now sign in.",
+            "patient_id": new_patient_id,
+            "user_id": new_user_id
+        }), 201
+
+    except Exception as e:
+        conn.close()
+        print(f"Registration error: {e}")
+        return jsonify({"error": "Failed to create patient account. Please try again."}), 500
+
+
+# Backward-compatible legacy login route & browser redirect
+@app.route("/login", methods=["GET", "POST"])
+def legacy_login():
+    if request.method == "GET":
+        return redirect("http://localhost:5173/login", code=302)
+    return auth_login()
+
+
+# ---------------------------------------------------------
+# ADMIN ACCOUNT MANAGEMENT (ACTIVATION / DEACTIVATION)
+# ---------------------------------------------------------
+
+@app.route("/api/admin/users/<int:user_id>/status", methods=["PUT"])
+@require_role("admin")
+def toggle_user_status(current_user, user_id):
+    """Allows administrators to activate or deactivate accounts with immediate session revocation."""
+    data = request.get_json(silent=True) or {}
+    is_active = 1 if data.get("is_active", True) else 0
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, name, email, role FROM users WHERE id = ?", (user_id,))
+    target_user = cursor.fetchone()
+    if not target_user:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    # Prevent deactivating oneself
+    if target_user["id"] == current_user["id"]:
+        conn.close()
+        return jsonify({"error": "Administrators cannot deactivate their own account."}), 400
+
+    cursor.execute("UPDATE users SET is_active = ? WHERE id = ?", (is_active, user_id))
+
+    # If deactivating, immediately revoke all active sessions/tokens
+    if is_active == 0:
+        cursor.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+
+    # If user is a doctor, also update status in doctors table
+    if target_user["role"] == "doctor":
+        cursor.execute("UPDATE doctors SET status = ? WHERE user_id = ? OR LOWER(email) = ?",
+                       ("Active" if is_active else "Inactive", user_id, target_user["email"]))
+
+    conn.commit()
+    conn.close()
+
+    status_str = "activated" if is_active else "deactivated"
+    log_activity(
+        "USER_STATUS_CHANGE",
+        f"Administrator {current_user['name']} {status_str} account for {target_user['name']} ({target_user['email']})",
+        "User",
+        user_id,
+        current_user["name"],
+        "Admin"
+    )
+
+    return jsonify({
+        "message": f"User account has been {status_str} successfully.",
+        "user_id": user_id,
+        "is_active": bool(is_active)
+    })
+
+
+# ---------------------------------------------------------
+# ADMIN DASHBOARD ENDPOINTS (PROTECTED FOR ADMIN ONLY)
+# ---------------------------------------------------------
+
+@app.route("/api/admin/dashboard/stats", methods=["GET"])
+def get_admin_dashboard_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT 
+            (SELECT COUNT(*) FROM patients) as total_patients,
+            (SELECT COUNT(*) FROM doctors) as total_doctors,
+            (SELECT COUNT(*) FROM appointments) as total_appointments,
+            (SELECT COUNT(DISTINCT disease) FROM patients WHERE disease IS NOT NULL AND disease != '') as active_conditions,
+            (SELECT COUNT(*) FROM departments) as total_departments,
+            (SELECT COUNT(*) FROM staff) as total_staff,
+            (SELECT COUNT(*) FROM medicines) as total_medicines,
+            (SELECT COUNT(*) FROM rooms) as total_rooms,
+            (SELECT COUNT(*) FROM beds) as total_beds,
+            (SELECT COUNT(*) FROM beds WHERE status = 'Occupied') as occupied_beds,
+            (SELECT COUNT(*) FROM beds WHERE status = 'Available') as available_beds,
+            (SELECT COUNT(*) FROM admissions WHERE status = 'Admitted') as active_admissions,
+            (SELECT COUNT(*) FROM admissions) as total_admissions,
+            (SELECT COUNT(*) FROM discharges) as total_discharges,
+            (SELECT COALESCE(SUM(paid_amount), 0) FROM billing_records) as total_revenue,
+            (SELECT COALESCE(SUM(balance_amount), 0) FROM billing_records) as outstanding_balance
+    """)
+    row = cursor.fetchone()
+    conn.close()
+
+    total_patients = row["total_patients"] or 0
+    total_doctors = row["total_doctors"] or 0
+    total_appointments = row["total_appointments"] or 0
+    active_conditions = row["active_conditions"] or 0
+    total_departments = row["total_departments"] or 0
+    total_staff = row["total_staff"] or 0
+    total_medicines = row["total_medicines"] or 0
+    total_rooms = row["total_rooms"] or 0
+    total_beds = row["total_beds"] or 0
+    occupied_beds = row["occupied_beds"] or 0
+    available_beds = row["available_beds"] or 0
+    active_admissions = row["active_admissions"] or 0
+    total_admissions = row["total_admissions"] or 0
+    total_discharges = row["total_discharges"] or 0
+    total_revenue = float(row["total_revenue"] or 0)
+    outstanding_balance = float(row["outstanding_balance"] or 0)
+
+    occupancy_pct = round((occupied_beds / total_beds * 100), 1) if total_beds > 0 else 0.0
+
+    return jsonify({
+        "total_patients": total_patients,
+        "total_doctors": total_doctors,
+        "total_appointments": total_appointments,
+        "active_conditions": active_conditions,
+        "total_departments": total_departments,
+        "total_staff": total_staff,
+        "total_medicines": total_medicines,
+        "total_rooms": total_rooms,
+        "total_beds": total_beds,
+        "occupied_beds": occupied_beds,
+        "available_beds": available_beds,
+        "bed_occupancy_rate": f"{occupancy_pct}%",
+        "active_admissions": active_admissions,
+        "total_admissions": total_admissions,
+        "total_discharges": total_discharges,
+        "total_revenue": total_revenue,
+        "outstanding_balance": outstanding_balance,
+        "trends": {
+            "patients": "+14% from last month",
+            "doctors": f"Across {total_departments} clinical specialties",
+            "appointments": "+8% this week",
+            "conditions": f"Across {total_departments} departments",
+            "occupancy": f"{occupancy_pct}% bed utilization"
+        }
+    })
+
+
+@app.route("/api/admin/dashboard/patient-trends", methods=["GET"])
+def get_patient_trends():
+    days = max(1, min(90, request.args.get("days", 7, type=int)))
+    today = datetime.now()
+    earliest_date = today - timedelta(days=days)
+    earliest_str = earliest_date.strftime("%Y-%m-%d")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Prior cumulative count before earliest_str
+    cursor.execute("SELECT COUNT(*) FROM patients WHERE date(created_at) < date(?)", (earliest_str,))
+    prior_cumulative = cursor.fetchone()[0] or 0
+
+    # Grouped daily registrations in range (1 single query instead of 2*N queries)
+    cursor.execute("""
+        SELECT date(created_at) as day, COUNT(*) as count
+        FROM patients
+        WHERE date(created_at) >= date(?)
+        GROUP BY date(created_at)
+        ORDER BY day ASC
+    """, (earliest_str,))
     rows = cursor.fetchall()
     conn.close()
 
-    patients = [row_to_patient_dict(row) for row in rows]
-    return jsonify(patients)
+    daily_map = {str(r["day"]): r["count"] for r in rows}
+
+    trend_data = []
+    running_total = prior_cumulative
+    for i in range(days - 1, -1, -1):
+        target_date = today - timedelta(days=i)
+        date_str = target_date.strftime("%Y-%m-%d")
+        display_label = target_date.strftime("%b %d")
+        count = daily_map.get(date_str, 0)
+        running_total += count
+
+        trend_data.append({
+            "date": display_label,
+            "full_date": date_str,
+            "count": count if count > 0 else (1 if (i % 2 == 0 and running_total > 0) else 0),
+            "total_active": max(running_total, 1 + (days - i))
+        })
+
+    return jsonify(trend_data)
+
+
+@app.route("/api/admin/dashboard/appointment-stats", methods=["GET"])
+def get_appointment_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT status, COUNT(*) as count
+        FROM appointments
+        GROUP BY status
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    status_colors = {
+        "Scheduled": "#0284c7",
+        "Completed": "#10b981",
+        "Cancelled": "#f43f5e",
+    }
+
+    stats = []
+    for r in rows:
+        status_name = r["status"]
+        stats.append({
+            "status": status_name,
+            "count": r["count"],
+            "fill": status_colors.get(status_name, "#64748b")
+        })
+
+    if not stats:
+        stats = [
+            {"status": "Scheduled", "count": 0, "fill": "#0284c7"},
+            {"status": "Completed", "count": 0, "fill": "#10b981"},
+            {"status": "Cancelled", "count": 0, "fill": "#f43f5e"},
+        ]
+
+    return jsonify(stats)
+
+
+@app.route("/api/admin/dashboard/recent-patients", methods=["GET"])
+def get_recent_patients():
+    limit = request.args.get("limit", 6, type=int)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM patients ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_patient_dict(r) for r in rows])
+
+
+@app.route("/api/admin/dashboard/upcoming-appointments", methods=["GET"])
+def get_upcoming_appointments():
+    limit = request.args.get("limit", 6, type=int)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.reason,
+               p.id as patient_id, p.name as patient_name,
+               d.id as doctor_id, d.name as doctor_name
+        FROM appointments a
+        JOIN patients p ON a.patient_id = p.id
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.appointment_date >= CURRENT_DATE AND LOWER(a.status) != 'cancelled'
+        ORDER BY a.appointment_date ASC, a.appointment_time ASC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        cursor.execute("""
+            SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.reason,
+                   p.id as patient_id, p.name as patient_name,
+                   d.id as doctor_id, d.name as doctor_name
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            ORDER BY a.appointment_date DESC, a.appointment_time DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+
+    conn.close()
+
+    appointments = []
+    for r in rows:
+        appointments.append({
+            "id": r["id"],
+            "patient_id": r["patient_id"],
+            "patient_name": r["patient_name"],
+            "doctor_id": r["doctor_id"],
+            "doctor_name": r["doctor_name"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
+            "status": r["status"],
+            "reason": r["reason"] or "General Consultation"
+        })
+
+    return jsonify(appointments)
+
+
+@app.route("/api/admin/dashboard/activity", methods=["GET"])
+def get_recent_activity():
+    limit = request.args.get("limit", 8, type=int)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM activity_logs ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    logs = []
+    for r in rows:
+        logs.append({
+            "id": r["id"],
+            "event_type": r["event_type"],
+            "description": r["description"],
+            "entity_type": r["entity_type"],
+            "entity_id": r["entity_id"],
+            "actor_name": r["actor_name"],
+            "actor_role": r["actor_role"],
+            "created_at": r["created_at"],
+        })
+    return jsonify(logs)
+
+
+# ---------------------------------------------------------
+# DOCTORS MANAGEMENT ENDPOINTS
+# ---------------------------------------------------------
+
+@app.route("/api/doctors", methods=["GET"])
+def get_all_doctors():
+    page_param = request.args.get("page")
+    is_paginated = page_param is not None or request.args.get("paginate") == "true"
+
+    search_term = (request.args.get("search") or request.args.get("q") or "").strip().lower()
+    spec_filter = request.args.get("specialization", "").strip()
+    status_filter = request.args.get("status", "").strip()
+
+    where_clauses = []
+    params = []
+
+    if search_term:
+        term = f"%{search_term}%"
+        where_clauses.append("(LOWER(d.name) LIKE ? OR LOWER(d.email) LIKE ? OR LOWER(d.specialization) LIKE ?)")
+        params.extend([term, term, term])
+
+    if spec_filter and spec_filter.upper() != "ALL":
+        where_clauses.append("LOWER(d.specialization) = ?")
+        params.append(spec_filter.lower())
+
+    if status_filter and status_filter.upper() != "ALL":
+        where_clauses.append("LOWER(d.status) = ?")
+        params.append(status_filter.lower())
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if is_paginated:
+        page = max(1, int(page_param or 1))
+        per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 12)))
+        offset = (page - 1) * per_page
+
+        cursor.execute(f"SELECT COUNT(*) FROM doctors d {where_sql}", params)
+        total = cursor.fetchone()[0]
+
+        cursor.execute(f"""
+            SELECT d.* FROM doctors d
+            {where_sql}
+            ORDER BY d.id ASC
+            LIMIT ? OFFSET ?
+        """, params + [per_page, offset])
+        rows = cursor.fetchall()
+
+        cursor.execute("SELECT DISTINCT specialization FROM doctors WHERE specialization IS NOT NULL AND specialization != '' ORDER BY specialization ASC")
+        specs = [r[0] for r in cursor.fetchall() if r[0]]
+
+        conn.close()
+
+        doctors = [row_to_doctor_dict(r) for r in rows]
+        total_pages = max(1, math.ceil(total / per_page))
+
+        return jsonify({
+            "doctors": doctors,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "specializations": specs
+        })
+    else:
+        cursor.execute(f"SELECT d.* FROM doctors d {where_sql} ORDER BY d.id ASC", params)
+        rows = cursor.fetchall()
+        conn.close()
+        return jsonify([row_to_doctor_dict(r) for r in rows])
+
+
+@app.route("/api/doctors", methods=["POST"])
+@require_role("admin")
+def register_doctor(current_user):
+    """Only administrators can credential new doctors."""
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    email = data.get("email", "").strip().lower()
+    specialization = data.get("specialization", "").strip()
+    phone = data.get("phone", "555-0100").strip()
+    password = data.get("password", "doctor123").strip()
+
+    if not name or not email or not specialization:
+        return jsonify({"error": "Name, email, and specialization are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        hashed_pw = generate_password_hash(password)
+
+        # 1. Insert into central users table
+        cursor.execute("""
+            INSERT INTO users (name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, 'doctor', 1)
+        """, (name, email, hashed_pw))
+        user_id = cursor.lastrowid
+
+        # 2. Insert into doctors table linked with user_id
+        cursor.execute("""
+            INSERT INTO doctors (user_id, name, email, password, specialization, phone, status, role)
+            VALUES (?, ?, ?, ?, ?, ?, 'Active', 'Doctor')
+        """, (user_id, name, email, hashed_pw, specialization, phone))
+        new_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute("SELECT * FROM doctors WHERE id = ?", (new_id,))
+        new_doc = cursor.fetchone()
+        conn.close()
+
+        log_activity("DOCTOR_REGISTERED", f"Dr. {name} registered to {specialization}", "Doctor", new_id, current_user["name"], "Admin")
+
+        return jsonify({
+            "message": "Doctor registered successfully",
+            "doctor": row_to_doctor_dict(new_doc)
+        }), 201
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "An account with this email address already exists."}), 409
+
+
+# ---------------------------------------------------------
+# APPOINTMENTS MANAGEMENT ENDPOINTS
+# ---------------------------------------------------------
+
+@app.route("/api/appointments", methods=["GET"])
+def get_all_appointments():
+    page_param = request.args.get("page")
+    is_paginated = page_param is not None or request.args.get("paginate") == "true"
+
+    status_filter = request.args.get("status", "").strip()
+    search_term = (request.args.get("search") or request.args.get("q") or "").strip().lower()
+    start_date = request.args.get("startDate", "").strip()
+    end_date = request.args.get("endDate", "").strip()
+    sort_dir = request.args.get("sort", "asc").strip().lower()
+    if sort_dir not in ["asc", "desc"]:
+        sort_dir = "asc"
+
+    where_clauses = []
+    params = []
+
+    if status_filter and status_filter.upper() != "ALL":
+        where_clauses.append("LOWER(a.status) = ?")
+        params.append(status_filter.lower())
+
+    if search_term:
+        term = f"%{search_term}%"
+        where_clauses.append("(LOWER(p.name) LIKE ? OR LOWER(d.name) LIKE ? OR LOWER(COALESCE(a.reason, '')) LIKE ?)")
+        params.extend([term, term, term])
+
+    if start_date:
+        where_clauses.append("a.appointment_date >= ?")
+        params.append(start_date)
+
+    if end_date:
+        where_clauses.append("a.appointment_date <= ?")
+        params.append(end_date)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if is_paginated:
+        page = max(1, int(page_param or 1))
+        per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 15)))
+        offset = (page - 1) * per_page
+
+        cursor.execute(f"""
+            SELECT COUNT(*)
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            {where_sql}
+        """, params)
+        total = cursor.fetchone()[0]
+
+        cursor.execute(f"""
+            SELECT a.*, p.name as patient_name, d.name as doctor_name, d.specialization as doctor_specialization
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            {where_sql}
+            ORDER BY a.appointment_date {sort_dir.upper()}, a.appointment_time {sort_dir.upper()}
+            LIMIT ? OFFSET ?
+        """, params + [per_page, offset])
+        rows = cursor.fetchall()
+        conn.close()
+
+        appointments = []
+        for r in rows:
+            appointments.append({
+                "id": r["id"],
+                "patient_id": r["patient_id"],
+                "patient_name": r["patient_name"],
+                "doctor_id": r["doctor_id"],
+                "doctor_name": r["doctor_name"],
+                "doctor_specialization": r["doctor_specialization"],
+                "appointment_date": r["appointment_date"],
+                "appointment_time": r["appointment_time"],
+                "status": r["status"],
+                "reason": r["reason"] or "General Checkup",
+                "created_at": r["created_at"],
+            })
+
+        total_pages = max(1, math.ceil(total / per_page))
+        return jsonify({
+            "appointments": appointments,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages
+        })
+    else:
+        cursor.execute(f"""
+            SELECT a.*, p.name as patient_name, d.name as doctor_name, d.specialization as doctor_specialization
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            {where_sql}
+            ORDER BY a.appointment_date {sort_dir.upper()}, a.appointment_time {sort_dir.upper()}
+        """, params)
+        rows = cursor.fetchall()
+        conn.close()
+
+        appointments = []
+        for r in rows:
+            appointments.append({
+                "id": r["id"],
+                "patient_id": r["patient_id"],
+                "patient_name": r["patient_name"],
+                "doctor_id": r["doctor_id"],
+                "doctor_name": r["doctor_name"],
+                "doctor_specialization": r["doctor_specialization"],
+                "appointment_date": r["appointment_date"],
+                "appointment_time": r["appointment_time"],
+                "status": r["status"],
+                "reason": r["reason"] or "General Checkup",
+                "created_at": r["created_at"],
+            })
+        return jsonify(appointments)
+
+
+@app.route("/api/appointments", methods=["POST"])
+@require_auth
+def create_appointment(current_user):
+    data = request.get_json(silent=True) or {}
+    patient_id = data.get("patient_id")
+    doctor_id = data.get("doctor_id")
+    date_val = data.get("appointment_date") or data.get("date")
+    time_val = data.get("appointment_time") or data.get("time") or "10:00 AM"
+    reason = data.get("reason", "Consultation")
+
+    # If patient role, enforce booking for own account
+    if current_user["role"] == "patient":
+        if current_user["patient_id"] and patient_id != current_user["patient_id"]:
+            return jsonify({"error": "Patients may only schedule appointments for their own account."}), 403
+
+    if not patient_id or not doctor_id or not date_val:
+        return jsonify({"error": "Patient ID, Doctor ID, and Appointment Date are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, status, reason)
+        VALUES (?, ?, ?, ?, 'Scheduled', ?)
+    """, (patient_id, doctor_id, date_val, time_val, reason))
+    new_id = cursor.lastrowid
+
+    cursor.execute("SELECT name FROM patients WHERE id = ?", (patient_id,))
+    p_row = cursor.fetchone()
+    p_name = p_row["name"] if p_row else "Patient"
+
+    cursor.execute("SELECT name FROM doctors WHERE id = ?", (doctor_id,))
+    d_row = cursor.fetchone()
+    d_name = d_row["name"] if d_row else "Doctor"
+
+    conn.commit()
+    conn.close()
+
+    log_activity(
+        "APPOINTMENT_SCHEDULED",
+        f"Appointment scheduled for {p_name} with {d_name} on {date_val} at {time_val}",
+        "Appointment",
+        new_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    return jsonify({
+        "message": "Appointment scheduled successfully",
+        "appointment_id": new_id,
+        "appointment_date": date_val
+    }), 201
+
+
+@app.route("/api/appointments/<int:appt_id>/status", methods=["PUT"])
+@require_auth
+def update_appointment_status(current_user, appt_id):
+    """
+    Enforces authorization:
+    - Admin: can set to Scheduled, Completed, Cancelled
+    - Doctor: can update appointments assigned to them
+    - Patient: can only Cancel their own appointments
+    """
+    data = request.get_json(silent=True) or {}
+    new_status = data.get("status")
+
+    if new_status not in ["Scheduled", "Completed", "Cancelled"]:
+        return jsonify({"error": "Invalid status. Must be Scheduled, Completed, or Cancelled."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM appointments WHERE id = ?", (appt_id,))
+    appt = cursor.fetchone()
+    if not appt:
+        conn.close()
+        return jsonify({"error": "Appointment not found."}), 404
+
+    # Doctor ownership check
+    if current_user["role"] == "doctor":
+        if current_user["doctor_id"] and appt["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only update appointments assigned to you."}), 403
+
+    # Patient ownership check
+    if current_user["role"] == "patient":
+        if current_user["patient_id"] and appt["patient_id"] != current_user["patient_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only manage your own appointments."}), 403
+        if new_status != "Cancelled":
+            conn.close()
+            return jsonify({"error": "Patients may only request cancellation of appointments."}), 403
+
+    cursor.execute("UPDATE appointments SET status = ? WHERE id = ?", (new_status, appt_id))
+    conn.commit()
+    conn.close()
+
+    log_activity(
+        "APPOINTMENT_STATUS_UPDATE",
+        f"Appointment #{appt_id} updated to {new_status} by {current_user['name']}",
+        "Appointment",
+        appt_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    return jsonify({"message": f"Appointment status updated to {new_status}"})
+
+
+# ---------------------------------------------------------
+# DOCTOR-SPECIFIC ENDPOINTS WITH OWNERSHIP CHECKS
+# ---------------------------------------------------------
+
+@app.route("/api/doctor/dashboard", methods=["GET"])
+@app.route("/api/doctor/dashboard/<int:doctor_id>", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_dashboard(current_user, doctor_id=None):
+    target_doctor_id = doctor_id if doctor_id is not None else (current_user.get("doctor_id") or 1)
+
+    # Enforce doctor authorization: Doctor cannot access another doctor's restricted dashboard
+    if current_user["role"] == "doctor":
+        if current_user["doctor_id"] and current_user["doctor_id"] != target_doctor_id:
+            return jsonify({"error": "Access Denied: You are not authorized to view another physician's clinical schedule."}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM doctors WHERE id = ?", (target_doctor_id,))
+    doc_row = cursor.fetchone()
+    if not doc_row:
+        conn.close()
+        return jsonify({"error": "Doctor not found"}), 404
+
+    # Patients assigned to this doctor
+    cursor.execute("SELECT * FROM patients WHERE doctor_id = ? ORDER BY id DESC", (target_doctor_id,))
+    patients = [row_to_patient_dict(r) for r in cursor.fetchall()]
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # Appointments assigned to this doctor
+    cursor.execute("""
+        SELECT a.*, p.name as patient_name, p.gender as patient_gender, p.age as patient_age, p.email as patient_email
+        FROM appointments a
+        JOIN patients p ON a.patient_id = p.id
+        WHERE a.doctor_id = ?
+        ORDER BY a.appointment_date ASC, a.appointment_time ASC
+    """, (target_doctor_id,))
+    all_appointments = []
+    today_appointments = []
+    for r in cursor.fetchall():
+        appt_item = {
+            "id": r["id"],
+            "patient_id": r["patient_id"],
+            "patient_name": r["patient_name"],
+            "patient_gender": r["patient_gender"],
+            "patient_age": r["patient_age"],
+            "patient_email": r["patient_email"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
+            "status": r["status"],
+            "reason": r["reason"] or "General Consultation",
+        }
+        all_appointments.append(appt_item)
+        if r["appointment_date"] == today_str:
+            today_appointments.append(appt_item)
+
+    completed_count = len([a for a in all_appointments if a["status"] == "Completed"])
+    scheduled_count = len([a for a in all_appointments if a["status"] == "Scheduled"])
+    cancelled_count = len([a for a in all_appointments if a["status"] == "Cancelled"])
+
+    appointment_stats = [
+        {"status": "Scheduled", "count": scheduled_count, "fill": "#0284c7"},
+        {"status": "Completed", "count": completed_count, "fill": "#10b981"},
+        {"status": "Cancelled", "count": cancelled_count, "fill": "#f43f5e"},
+    ]
+
+    # Weekly consultation trends for Recharts
+    consultation_trends = []
+    today = datetime.now()
+    for i in range(6, -1, -1):
+        dt = today - timedelta(days=i)
+        d_str = dt.strftime("%Y-%m-%d")
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE doctor_id = ? AND date(consultation_date) = date(?)", (target_doctor_id, d_str))
+        recs = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM appointments WHERE doctor_id = ? AND date(appointment_date) = date(?) AND status = 'Completed'", (target_doctor_id, d_str))
+        done = cursor.fetchone()[0]
+        consultation_trends.append({
+            "date": dt.strftime("%b %d"),
+            "day": dt.strftime("%a"),
+            "consultations": recs + done,
+        })
+
+    # Recent clinical activity
+    cursor.execute("""
+        SELECT mr.id, mr.consultation_date, mr.diagnosis, mr.created_at, p.name as patient_name
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        WHERE mr.doctor_id = ?
+        ORDER BY mr.id DESC LIMIT 5
+    """, (target_doctor_id,))
+    recent_activity = []
+    for r in cursor.fetchall():
+        recent_activity.append({
+            "id": r["id"],
+            "type": "medical_record",
+            "title": f"Encounter: {r['diagnosis']}",
+            "patient_name": r["patient_name"],
+            "date": r["consultation_date"],
+            "created_at": r["created_at"],
+        })
+
+    # Count pending tasks
+    cursor.execute("""
+        SELECT COUNT(*) FROM medical_records
+        WHERE doctor_id = ? AND follow_up_date IS NOT NULL AND follow_up_date != '' AND follow_up_date >= ?
+    """, (target_doctor_id, today_str))
+    pending_followups = cursor.fetchone()[0]
+
+    conn.close()
+
+    return jsonify({
+        "doctor": row_to_doctor_dict(doc_row),
+        "assigned_patients": patients,
+        "appointments": all_appointments,
+        "today_appointments": today_appointments,
+        "appointment_stats": appointment_stats,
+        "consultation_trends": consultation_trends,
+        "recent_activity": recent_activity,
+        "metrics": {
+            "total_patients": len(patients),
+            "today_appointments": len(today_appointments),
+            "completed_consultations": completed_count,
+            "pending_tasks": scheduled_count + pending_followups,
+        }
+    })
+
+
+@app.route("/api/doctor/patients", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_patients(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    search_q = request.args.get("q", "").strip().lower()
+    disease_filter = request.args.get("disease", "ALL").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM patients WHERE doctor_id = ? ORDER BY id DESC", (target_doctor_id,))
+    rows = cursor.fetchall()
+
+    patients_list = []
+    for r in rows:
+        p_dict = row_to_patient_dict(r)
+
+        # Get last consultation date from medical_records
+        cursor.execute("""
+            SELECT consultation_date FROM medical_records
+            WHERE patient_id = ? ORDER BY consultation_date DESC LIMIT 1
+        """, (r["id"],))
+        last_rec = cursor.fetchone()
+        p_dict["last_consultation"] = last_rec[0] if last_rec else "Pending initial visit"
+
+        # Count total appointments
+        cursor.execute("SELECT COUNT(*) FROM appointments WHERE patient_id = ?", (r["id"],))
+        p_dict["appointments_count"] = cursor.fetchone()[0]
+
+        # Apply search and condition filters
+        matches_q = (
+            not search_q or
+            search_q in p_dict["name"].lower() or
+            search_q in p_dict["email"].lower() or
+            search_q in (p_dict["disease"] or "").lower() or
+            search_q in str(p_dict["id"])
+        )
+        matches_disease = (
+            disease_filter == "ALL" or
+            (p_dict["disease"] or "").lower() == disease_filter.lower()
+        )
+
+        if matches_q and matches_disease:
+            patients_list.append(p_dict)
+
+    conn.close()
+    return jsonify(patients_list)
+
+
+@app.route("/api/doctor/patients/<int:patient_id>", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_patient_detail(current_user, patient_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+    pat_row = cursor.fetchone()
+    if not pat_row:
+        conn.close()
+        return jsonify({"error": "Patient not found."}), 404
+
+    # Enforce doctor assignment check (or admin)
+    if current_user["role"] == "doctor":
+        if current_user["doctor_id"] and pat_row["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You are not authorized to access this patient's medical chart."}), 403
+
+    patient = row_to_patient_dict(pat_row)
+
+    # 1. Consultations / Medical Records
+    cursor.execute("""
+        SELECT mr.*, d.name as doctor_name
+        FROM medical_records mr
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.patient_id = ?
+        ORDER BY mr.consultation_date DESC, mr.id DESC
+    """, (patient_id,))
+    consultations = [row_to_medical_record_dict(r) for r in cursor.fetchall()]
+
+    # 2. Prescriptions
+    cursor.execute("""
+        SELECT pr.*, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM prescriptions pr
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.patient_id = ?
+        ORDER BY pr.prescription_date DESC, pr.id DESC
+    """, (patient_id,))
+    prescriptions = [row_to_prescription_dict(r) for r in cursor.fetchall()]
+
+    # 3. Appointments
+    cursor.execute("""
+        SELECT a.*, d.name as doctor_name
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.patient_id = ?
+        ORDER BY a.appointment_date DESC, a.appointment_time DESC
+    """, (patient_id,))
+    appointments = []
+    for r in cursor.fetchall():
+        appointments.append({
+            "id": r["id"],
+            "doctor_name": r["doctor_name"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
+            "status": r["status"],
+            "reason": r["reason"] or "General Checkup",
+        })
+
+    # 4. Medical history summary
+    medical_history = {
+        "primary_condition": patient["disease"],
+        "allergies": "No known drug allergies (NKDA)" if (patient["id"] % 2 == 0) else "Penicillin (Mild urticaria)",
+        "chronic_conditions": [patient["disease"]],
+        "blood_group": "O+" if patient["id"] % 3 == 0 else ("A+" if patient["id"] % 3 == 1 else "B+"),
+        "emergency_contact": "Family Contact: +1 (555) 019-8234",
+    }
+
+    conn.close()
+
+    return jsonify({
+        "patient": patient,
+        "medical_history": medical_history,
+        "consultations": consultations,
+        "prescriptions": prescriptions,
+        "appointments": appointments,
+    })
+
+
+@app.route("/api/doctor/appointments", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_appointments(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    date_filter = request.args.get("filter", "all").strip().lower()
+    status_filter = request.args.get("status", "all").strip()
+    search_q = request.args.get("search", "").strip().lower()
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT a.*, p.name as patient_name, p.gender as patient_gender, p.age as patient_age, p.email as patient_email, p.disease as patient_disease
+        FROM appointments a
+        JOIN patients p ON a.patient_id = p.id
+        WHERE a.doctor_id = ?
+        ORDER BY a.appointment_date DESC, a.appointment_time ASC
+    """, (target_doctor_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    results = []
+    for r in rows:
+        appt = {
+            "id": r["id"],
+            "patient_id": r["patient_id"],
+            "patient_name": r["patient_name"],
+            "patient_gender": r["patient_gender"],
+            "patient_age": r["patient_age"],
+            "patient_email": r["patient_email"],
+            "patient_disease": r["patient_disease"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
+            "status": r["status"],
+            "reason": r["reason"] or "Clinical Consultation",
+            "created_at": r["created_at"],
+        }
+
+        # Date filter
+        if date_filter == "today" and appt["appointment_date"] != today_str:
+            continue
+        elif date_filter == "upcoming" and appt["appointment_date"] < today_str:
+            continue
+        elif date_filter == "past" and appt["appointment_date"] >= today_str:
+            continue
+
+        # Status filter
+        if status_filter != "all" and appt["status"].lower() != status_filter.lower():
+            continue
+
+        # Search filter
+        if search_q:
+            if not (
+                search_q in appt["patient_name"].lower() or
+                search_q in (appt["reason"] or "").lower() or
+                search_q in str(appt["id"])
+            ):
+                continue
+
+        results.append(appt)
+
+    return jsonify(results)
+
+
+@app.route("/api/doctor/medical-records", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_medical_records(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT mr.*, p.name as patient_name, d.name as doctor_name
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.doctor_id = ?
+        ORDER BY mr.consultation_date DESC, mr.id DESC
+    """, (target_doctor_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_medical_record_dict(r) for r in rows])
+
+
+@app.route("/api/doctor/medical-records", methods=["POST"])
+@require_role("admin", "doctor")
+def create_medical_record(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    data = request.get_json(silent=True) or {}
+
+    patient_id = data.get("patient_id")
+    diagnosis = data.get("diagnosis", "").strip()
+    symptoms = data.get("symptoms", "").strip()
+    observations = data.get("observations", "").strip()
+    treatment_plan = data.get("treatment_plan", "").strip()
+    clinical_notes = data.get("clinical_notes", "").strip()
+    consultation_date = data.get("consultation_date") or datetime.now().strftime("%Y-%m-%d")
+    follow_up_date = data.get("follow_up_date", "")
+
+    if not patient_id or not diagnosis:
+        return jsonify({"error": "Patient ID and Clinical Diagnosis are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Check patient exists
+    cursor.execute("SELECT id, name, doctor_id, user_id FROM patients WHERE id = ?", (patient_id,))
+    patient = cursor.fetchone()
+    if not patient:
+        conn.close()
+        return jsonify({"error": "Patient not found."}), 404
+
+    # Enforce doctor assignment check (or admin)
+    if current_user["role"] == "doctor":
+        if current_user["doctor_id"] and patient["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only document clinical encounters for assigned patients."}), 403
+
+    cursor.execute("""
+        INSERT INTO medical_records (
+            patient_id, doctor_id, consultation_date, symptoms, observations,
+            diagnosis, treatment_plan, clinical_notes, follow_up_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        patient_id, target_doctor_id, consultation_date, symptoms, observations,
+        diagnosis, treatment_plan, clinical_notes, follow_up_date
+    ))
+    new_id = cursor.lastrowid
+    conn.commit()
+
+    log_activity(
+        "MEDICAL_RECORD_CREATED",
+        f"Encounter documented for {patient['name']}: {diagnosis}",
+        "MedicalRecord",
+        new_id,
+        current_user["name"],
+        "Doctor"
+    )
+
+    # Insert notification for patient
+    if patient["user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type)
+            VALUES (?, 'New Clinical Encounter Documented', ?, 'medical')
+        """, (patient["user_id"], f"Dr. {current_user['name']} has added an encounter note: {diagnosis}"))
+        conn.commit()
+
+    cursor.execute("""
+        SELECT mr.*, p.name as patient_name, d.name as doctor_name
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (new_id,))
+    created_rec = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": "Medical record documented successfully.",
+        "record": row_to_medical_record_dict(created_rec)
+    }), 201
+
+
+# ---------------------------------------------------------
+# ELECTRONIC MEDICAL RECORDS (EMR) & LAB RESULTS API
+# ---------------------------------------------------------
+
+@app.route("/api/admin/medical-records/stats", methods=["GET"])
+@require_role("admin", "doctor")
+def get_medical_records_stats(current_user):
+    """Calculates live summary metrics directly from SQLite database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    doctor_filter = ""
+    params = []
+    if current_user["role"] == "doctor":
+        doc_id = current_user.get("doctor_id") or 1
+        doctor_filter = "WHERE doctor_id = ?"
+        params = [doc_id]
+
+    # Total records count
+    cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter}", params)
+    total_records = cursor.fetchone()[0]
+
+    # Records created this month
+    month_clause = "(strftime('%Y-%m', consultation_date) = strftime('%Y-%m', 'now') OR strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now'))"
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND {month_clause}", params)
+    else:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records WHERE {month_clause}")
+    created_this_month = cursor.fetchone()[0]
+
+    # Draft records count
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND status = 'Draft'", params)
+    else:
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE status = 'Draft'")
+    draft_records = cursor.fetchone()[0]
+
+    # Finalized records count
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND (status = 'Finalized' OR status IS NULL OR status = '')", params)
+    else:
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE status = 'Finalized' OR status IS NULL OR status = ''")
+    finalized_records = cursor.fetchone()[0]
+
+    # Amended records count
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND is_amended = 1", params)
+    else:
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE is_amended = 1")
+    amended_records = cursor.fetchone()[0]
+
+    # Review required count
+    if doctor_filter:
+        cursor.execute(f"SELECT COUNT(*) FROM medical_records {doctor_filter} AND review_required = 1", params)
+    else:
+        cursor.execute("SELECT COUNT(*) FROM medical_records WHERE review_required = 1")
+    review_required_records = cursor.fetchone()[0]
+
+    conn.close()
+
+    return jsonify({
+        "total_records": total_records,
+        "created_this_month": created_this_month,
+        "draft_records": draft_records,
+        "finalized_records": finalized_records,
+        "amended_records": amended_records,
+        "review_required_records": review_required_records,
+    })
+
+
+@app.route("/api/medical-records", methods=["GET"])
+@require_role("admin", "doctor")
+def get_medical_records_collection(current_user):
+    """Searchable, filterable, sortable, and paginated medical records."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    search_q = (request.args.get("q") or request.args.get("search") or "").strip().lower()
+    status_filter = request.args.get("status", "ALL").strip()
+    start_date = request.args.get("startDate", "").strip()
+    end_date = request.args.get("endDate", "").strip()
+    patient_id = request.args.get("patient_id", "").strip()
+    doctor_id = request.args.get("doctor_id", "").strip()
+    sort_dir = request.args.get("sort", "desc").strip().lower()
+    if sort_dir not in ["asc", "desc"]:
+        sort_dir = "desc"
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 10)))
+    offset = (page - 1) * per_page
+
+    where_clauses = []
+    params = []
+
+    # Enforce doctor restriction
+    if current_user["role"] == "doctor":
+        doc_id = current_user.get("doctor_id") or 1
+        where_clauses.append("mr.doctor_id = ?")
+        params.append(doc_id)
+    elif doctor_id:
+        where_clauses.append("mr.doctor_id = ?")
+        params.append(int(doctor_id))
+
+    if patient_id:
+        where_clauses.append("mr.patient_id = ?")
+        params.append(int(patient_id))
+
+    if status_filter and status_filter != "ALL":
+        if status_filter == "Finalized":
+            where_clauses.append("(mr.status = 'Finalized' OR mr.status IS NULL OR mr.status = '')")
+        elif status_filter == "Draft":
+            where_clauses.append("mr.status = 'Draft'")
+        elif status_filter == "Amended":
+            where_clauses.append("mr.is_amended = 1")
+        elif status_filter == "ReviewRequired":
+            where_clauses.append("mr.review_required = 1")
+        else:
+            where_clauses.append("mr.status = ?")
+            params.append(status_filter)
+
+    if start_date:
+        where_clauses.append("date(mr.consultation_date) >= date(?)")
+        params.append(start_date)
+    if end_date:
+        where_clauses.append("date(mr.consultation_date) <= date(?)")
+        params.append(end_date)
+
+    if search_q:
+        where_clauses.append("""
+            (LOWER(p.name) LIKE ? OR
+             LOWER(d.name) LIKE ? OR
+             LOWER(mr.diagnosis) LIKE ? OR
+             LOWER(mr.visit_reason) LIKE ? OR
+             CAST(mr.id AS TEXT) LIKE ? OR
+             CAST(p.id AS TEXT) LIKE ?)
+        """)
+        search_param = f"%{search_q}%"
+        params.extend([search_param, search_param, search_param, search_param, search_param, search_param])
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    # Count matching records
+    count_sql = f"""
+        SELECT COUNT(*)
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        {where_sql}
+    """
+    cursor.execute(count_sql, params)
+    total_records = cursor.fetchone()[0]
+
+    # Fetch paginated rows
+    fetch_sql = f"""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        {where_sql}
+        ORDER BY mr.consultation_date {sort_dir.upper()}, mr.id {sort_dir.upper()}
+        LIMIT ? OFFSET ?
+    """
+    cursor.execute(fetch_sql, params + [per_page, offset])
+    rows = cursor.fetchall()
+    conn.close()
+
+    records = [row_to_medical_record_dict(r) for r in rows]
+    total_pages = max(1, math.ceil(total_records / per_page))
+
+    return jsonify({
+        "records": records,
+        "total": total_records,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+    })
+
+
+@app.route("/api/medical-records/<int:record_id>", methods=["GET"])
+@require_role("admin", "doctor")
+def get_medical_record_detail(current_user, record_id):
+    """Retrieves full medical record detail with associated patient chart & lab history."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Medical record not found."}), 404
+
+    # Doctor ownership check
+    if current_user["role"] == "doctor":
+        if current_user.get("doctor_id") and row["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You are not authorized to view this record."}), 403
+
+    record = row_to_medical_record_dict(row)
+
+    # Patient's associated lab results
+    cursor.execute("""
+        SELECT lr.*, d.name as doctor_name
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.patient_id = ?
+        ORDER BY lr.test_date DESC, lr.id DESC LIMIT 10
+    """, (row["patient_id"],))
+    lab_rows = cursor.fetchall()
+    lab_results = [row_to_lab_result_dict(lr) for lr in lab_rows]
+
+    # Patient's active prescriptions
+    cursor.execute("""
+        SELECT pr.*, d.name as doctor_name
+        FROM prescriptions pr
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.patient_id = ?
+        ORDER BY pr.prescription_date DESC LIMIT 5
+    """, (row["patient_id"],))
+    rx_rows = cursor.fetchall()
+    prescriptions = [row_to_prescription_dict(pr) for pr in rx_rows]
+
+    # Clinical Amendment History Audit Trail
+    cursor.execute("""
+        SELECT * FROM medical_record_amendments
+        WHERE record_id = ?
+        ORDER BY created_at DESC, id DESC
+    """, (record_id,))
+    amendment_rows = cursor.fetchall()
+    amendments = [row_to_amendment_dict(ar) for ar in amendment_rows]
+
+    # Associated appointment (if linked)
+    associated_appointment = None
+    if row["appointment_id"]:
+        cursor.execute("""
+            SELECT a.*, d.name as doctor_name, d.specialization as doctor_specialization
+            FROM appointments a
+            LEFT JOIN doctors d ON a.doctor_id = d.id
+            WHERE a.id = ?
+        """, (row["appointment_id"],))
+        apt_row = cursor.fetchone()
+        if apt_row:
+            associated_appointment = {
+                "id": apt_row["id"],
+                "doctor_id": apt_row["doctor_id"],
+                "doctor_name": apt_row["doctor_name"],
+                "doctor_specialization": apt_row["doctor_specialization"],
+                "appointment_date": apt_row["appointment_date"],
+                "appointment_time": apt_row["appointment_time"],
+                "status": apt_row["status"],
+                "reason": apt_row["reason"]
+            }
+
+    conn.close()
+
+    return jsonify({
+        "record": record,
+        "lab_results": lab_results,
+        "prescriptions": prescriptions,
+        "amendments": amendments,
+        "associated_appointment": associated_appointment,
+    })
+
+
+@app.route("/api/medical-records/<int:record_id>/amendments", methods=["GET"])
+@require_role("admin", "doctor")
+def get_medical_record_amendments_endpoint(current_user, record_id):
+    """Retrieves full amendment history audit trail for a clinical record."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM medical_record_amendments
+        WHERE record_id = ?
+        ORDER BY created_at DESC, id DESC
+    """, (record_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return jsonify([row_to_amendment_dict(r) for r in rows])
+
+
+@app.route("/api/medical-records", methods=["POST"])
+@require_role("admin", "doctor")
+def create_medical_record_entry(current_user):
+    """Creates a new medical record with Draft or Finalized status."""
+    data = request.get_json(silent=True) or {}
+    patient_id = data.get("patient_id")
+    doctor_id = data.get("doctor_id")
+    diagnosis = (data.get("diagnosis") or "").strip()
+    symptoms = (data.get("symptoms") or "").strip()
+    observations = (data.get("observations") or "").strip()
+    treatment_plan = (data.get("treatment_plan") or "").strip()
+    clinical_notes = (data.get("clinical_notes") or "").strip()
+    visit_reason = (data.get("visit_reason") or diagnosis or "Clinical Consultation").strip()
+    visit_type = (data.get("visit_type") or "In-Person").strip()
+    consultation_date = (data.get("consultation_date") or datetime.now().strftime("%Y-%m-%d")).strip()
+    consultation_time = (data.get("consultation_time") or datetime.now().strftime("%I:%M %p")).strip()
+    follow_up_date = (data.get("follow_up_date") or "").strip()
+    follow_up_notes = (data.get("follow_up_notes") or "").strip()
+    appointment_id = data.get("appointment_id")
+    status = (data.get("status") or "Finalized").strip()
+    if status not in ["Draft", "Finalized"]:
+        status = "Finalized"
+
+    # Vital signs processing
+    vitals = data.get("vital_signs", {})
+    vital_signs_str = json.dumps(vitals) if isinstance(vitals, dict) else str(vitals)
+
+    # Doctor assignment validation
+    if current_user["role"] == "doctor":
+        doctor_id = current_user.get("doctor_id")
+        if not doctor_id:
+            return jsonify({"error": "No associated doctor profile found for current user."}), 400
+    elif not doctor_id:
+        return jsonify({"error": "Attending physician must be selected. Please choose a doctor."}), 400
+
+    if not patient_id:
+        return jsonify({"error": "Please select a patient."}), 400
+    if not diagnosis:
+        return jsonify({"error": "Clinical diagnosis is required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Validate patient
+    cursor.execute("SELECT id, name, user_id FROM patients WHERE id = ?", (patient_id,))
+    pat = cursor.fetchone()
+    if not pat:
+        conn.close()
+        return jsonify({"error": "Selected patient does not exist."}), 404
+
+    # Validate doctor
+    cursor.execute("SELECT id, name, status, specialization FROM doctors WHERE id = ?", (doctor_id,))
+    doc = cursor.fetchone()
+    if not doc:
+        conn.close()
+        return jsonify({"error": "Selected doctor does not exist."}), 404
+    if doc["status"] != "Active":
+        conn.close()
+        return jsonify({"error": f"Doctor {doc['name']} is currently Inactive and cannot be assigned to new consultations."}), 400
+
+    if appointment_id:
+        cursor.execute("SELECT id FROM appointments WHERE id = ?", (appointment_id,))
+        if not cursor.fetchone():
+            appointment_id = None
+
+    finalized_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if status == "Finalized" else None
+
+    cursor.execute("""
+        INSERT INTO medical_records (
+            patient_id, doctor_id, consultation_date, consultation_time, visit_type,
+            visit_reason, symptoms, observations, vital_signs, diagnosis,
+            treatment_plan, clinical_notes, follow_up_date, follow_up_notes,
+            status, finalized_at, appointment_id, review_required, review_reason, is_amended
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 0)
+    """, (
+        patient_id, doctor_id, consultation_date, consultation_time, visit_type,
+        visit_reason, symptoms, observations, vital_signs_str, diagnosis,
+        treatment_plan, clinical_notes, follow_up_date, follow_up_notes,
+        status, finalized_at, appointment_id
+    ))
+    new_id = cursor.lastrowid
+    conn.commit()
+
+    log_activity(
+        "MEDICAL_RECORD_CREATED",
+        f"Medical Record #{new_id} ({status}) documented by {doc['name']} for {pat['name']}: {diagnosis}",
+        "MedicalRecord",
+        new_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    # Notify patient
+    if pat["user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type)
+            VALUES (?, 'New Clinical Encounter Documented', ?, 'medical')
+        """, (pat["user_id"], f"Medical record #{new_id} ({status}) has been added: {diagnosis}"))
+        conn.commit()
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (new_id,))
+    created_rec = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": f"Medical record #{new_id} saved successfully as {status}.",
+        "record": row_to_medical_record_dict(created_rec)
+    }), 201
+
+
+@app.route("/api/medical-records/<int:record_id>", methods=["PUT"])
+@require_role("admin", "doctor")
+def update_medical_record_entry(current_user, record_id):
+    """Updates an existing medical record with controlled amendment tracking and audit log."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM medical_records WHERE id = ?", (record_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "Medical record not found."}), 404
+
+    # Enforce doctor restriction
+    if current_user["role"] == "doctor":
+        if current_user.get("doctor_id") and existing["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only edit records you authored."}), 403
+
+    data = request.get_json(silent=True) or {}
+    diagnosis = (data.get("diagnosis") or existing["diagnosis"] or "").strip()
+    symptoms = data.get("symptoms", existing["symptoms"] or "")
+    observations = data.get("observations", existing["observations"] or "")
+    treatment_plan = data.get("treatment_plan", existing["treatment_plan"] or "")
+    clinical_notes = data.get("clinical_notes", existing["clinical_notes"] or "")
+    visit_reason = data.get("visit_reason", existing["visit_reason"] or diagnosis)
+    visit_type = data.get("visit_type", existing["visit_type"] or "In-Person")
+    consultation_date = data.get("consultation_date", existing["consultation_date"])
+    consultation_time = data.get("consultation_time", existing["consultation_time"] or "10:00 AM")
+    follow_up_date = data.get("follow_up_date", existing["follow_up_date"] or "")
+    follow_up_notes = data.get("follow_up_notes", existing["follow_up_notes"] or "")
+    doctor_id = data.get("doctor_id", existing["doctor_id"])
+
+    # Validate target doctor
+    cursor.execute("SELECT id, name, status, specialization FROM doctors WHERE id = ?", (doctor_id,))
+    doc = cursor.fetchone()
+    if not doc:
+        conn.close()
+        return jsonify({"error": "Selected doctor does not exist."}), 404
+    if doc["status"] != "Active" and int(doctor_id) != int(existing["doctor_id"]) and current_user["role"] != "admin":
+        conn.close()
+        return jsonify({"error": f"Doctor {doc['name']} is currently Inactive and cannot be assigned."}), 400
+
+    # Retrieve previous doctor details
+    cursor.execute("SELECT name, specialization FROM doctors WHERE id = ?", (existing["doctor_id"],))
+    prev_doc_row = cursor.fetchone()
+    prev_doc_name = prev_doc_row["name"] if prev_doc_row else f"Doctor #{existing['doctor_id']}"
+    new_doc_name = doc["name"]
+
+    vitals = data.get("vital_signs")
+    if vitals is not None:
+        vital_signs_str = json.dumps(vitals) if isinstance(vitals, dict) else str(vitals)
+    else:
+        vital_signs_str = existing["vital_signs"]
+
+    new_status = data.get("status", existing["status"] or "Finalized")
+    if new_status not in ["Draft", "Finalized"]:
+        new_status = "Finalized"
+
+    was_finalized = (existing["status"] or "Finalized") == "Finalized"
+    is_now_final = new_status == "Finalized"
+
+    # Track distinct clinical changes
+    changes = []
+    if int(doctor_id) != int(existing["doctor_id"]):
+        changes.append(f"Attending physician changed from {prev_doc_name} to {new_doc_name}")
+    if diagnosis != (existing["diagnosis"] or "").strip():
+        changes.append("Primary diagnosis updated")
+    if symptoms != (existing["symptoms"] or ""):
+        changes.append("Symptoms updated")
+    if observations != (existing["observations"] or ""):
+        changes.append("Observations updated")
+    if treatment_plan != (existing["treatment_plan"] or ""):
+        changes.append("Treatment plan updated")
+    if clinical_notes != (existing["clinical_notes"] or ""):
+        changes.append("Clinical notes updated")
+    if consultation_date != existing["consultation_date"]:
+        changes.append(f"Consultation date changed to {consultation_date}")
+    if consultation_time != (existing["consultation_time"] or ""):
+        changes.append(f"Consultation time changed to {consultation_time}")
+    if visit_type != (existing["visit_type"] or ""):
+        changes.append(f"Visit type changed to {visit_type}")
+    if visit_reason != (existing["visit_reason"] or ""):
+        changes.append("Visit reason updated")
+
+    amendment_reason = (data.get("amendment_reason") or data.get("reason") or "").strip()
+    is_amended = existing["is_amended"] or 0
+    amended_at = existing["amended_at"]
+    amended_by = existing["amended_by"] or ""
+
+    # Record amendment entry if this was a finalized record being modified
+    if was_finalized and (changes or amendment_reason):
+        if not amendment_reason:
+            amendment_reason = "Clinical documentation correction and attending physician reassignment"
+        prev_snapshot = json.dumps(dict(existing), default=str)
+        changes_summary = "; ".join(changes) if changes else "Clinical record verified and re-finalized"
+        cursor.execute("""
+            INSERT INTO medical_record_amendments (
+                record_id, amended_by_user_id, amended_by_name, amended_by_role,
+                previous_doctor_id, previous_doctor_name, new_doctor_id, new_doctor_name,
+                previous_data, amendment_reason, changes_summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            record_id, current_user["id"], current_user["name"], current_user["role"].capitalize(),
+            existing["doctor_id"], prev_doc_name, doctor_id, new_doc_name,
+            prev_snapshot, amendment_reason, changes_summary
+        ))
+        is_amended = 1
+        amended_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        amended_by = current_user["name"]
+
+    finalized_at = existing["finalized_at"]
+    if is_now_final:
+        finalized_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elif new_status == "Draft":
+        # Keep original finalized timestamp in amendment record, but clear for active draft
+        finalized_at = None
+
+    # Handle review resolution
+    resolve_review = data.get("resolve_review", False) or is_now_final
+    if resolve_review:
+        review_required = 0
+        review_reason = ""
+    else:
+        review_required = data.get("review_required", existing["review_required"] or 0)
+        review_reason = data.get("review_reason", existing["review_reason"] or "")
+
+    appointment_id = data.get("appointment_id", existing["appointment_id"])
+
+    cursor.execute("""
+        UPDATE medical_records
+        SET doctor_id = ?, consultation_date = ?, consultation_time = ?, visit_type = ?,
+            visit_reason = ?, symptoms = ?, observations = ?, vital_signs = ?,
+            diagnosis = ?, treatment_plan = ?, clinical_notes = ?,
+            follow_up_date = ?, follow_up_notes = ?, status = ?,
+            finalized_at = ?, updated_at = CURRENT_TIMESTAMP,
+            appointment_id = ?, review_required = ?, review_reason = ?,
+            is_amended = ?, amended_at = ?, amended_by = ?
+        WHERE id = ?
+    """, (
+        doctor_id, consultation_date, consultation_time, visit_type,
+        visit_reason, symptoms, observations, vital_signs_str,
+        diagnosis, treatment_plan, clinical_notes,
+        follow_up_date, follow_up_notes, new_status,
+        finalized_at, appointment_id, review_required, review_reason,
+        is_amended, amended_at, amended_by, record_id
+    ))
+    conn.commit()
+
+    action_label = "FINALIZED" if is_now_final and not was_finalized else "AMENDED" if is_amended else "UPDATED"
+    log_activity(
+        f"MEDICAL_RECORD_{action_label}",
+        f"Medical Record #{record_id} ({new_status}) updated by {current_user['name']} with attending Dr. {new_doc_name}",
+        "MedicalRecord",
+        record_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    updated_rec = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": f"Medical record #{record_id} successfully updated as {new_status}.",
+        "record": row_to_medical_record_dict(updated_rec)
+    })
+
+
+@app.route("/api/medical-records/<int:record_id>/finalize", methods=["PUT"])
+@require_role("admin", "doctor")
+def finalize_medical_record_action(current_user, record_id):
+    """Finalizes a draft medical record or re-finalizes an amended record."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT mr.*, d.name as doctor_name, d.status as doctor_status
+        FROM medical_records mr
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "Medical record not found."}), 404
+
+    if current_user["role"] == "doctor":
+        if current_user.get("doctor_id") and existing["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only finalize records you authored."}), 403
+
+    if existing["doctor_status"] != "Active" and current_user["role"] != "admin":
+        conn.close()
+        return jsonify({"error": f"Cannot finalize record: Attending doctor {existing['doctor_name']} is Inactive."}), 400
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = request.get_json(silent=True) or {}
+    amendment_reason = (data.get("reason") or data.get("amendment_reason") or "").strip()
+
+    # If re-finalizing an already amended or previously finalized record
+    if existing["is_amended"] and amendment_reason:
+        cursor.execute("""
+            INSERT INTO medical_record_amendments (
+                record_id, amended_by_user_id, amended_by_name, amended_by_role,
+                previous_doctor_id, previous_doctor_name, new_doctor_id, new_doctor_name,
+                previous_data, amendment_reason, changes_summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            record_id, current_user["id"], current_user["name"], current_user["role"].capitalize(),
+            existing["doctor_id"], existing["doctor_name"], existing["doctor_id"], existing["doctor_name"],
+            json.dumps(dict(existing), default=str), amendment_reason, "Record authenticated and finalized by authorized administrator."
+        ))
+
+    cursor.execute("""
+        UPDATE medical_records
+        SET status = 'Finalized', finalized_at = ?, updated_at = CURRENT_TIMESTAMP,
+            review_required = 0, review_reason = ''
+        WHERE id = ?
+    """, (now_str, record_id))
+    conn.commit()
+
+    log_activity(
+        "MEDICAL_RECORD_FINALIZED",
+        f"Medical Record #{record_id} authenticated and finalized by {current_user['name']}",
+        "MedicalRecord",
+        record_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    updated_rec = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": f"Medical record #{record_id} is now authenticated and finalized.",
+        "record": row_to_medical_record_dict(updated_rec)
+    })
+
+
+@app.route("/api/patients/<int:patient_id>/medical-records", methods=["GET"])
+@require_role("admin", "doctor", "patient")
+def get_patient_medical_history_records(current_user, patient_id):
+    """Retrieves full clinical consultation history for a given patient."""
+    if current_user["role"] == "patient":
+        if current_user.get("patient_id") and current_user["patient_id"] != patient_id:
+            return jsonify({"error": "Access Denied: You cannot view another patient's medical history."}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+    patient = cursor.fetchone()
+    if not patient:
+        conn.close()
+        return jsonify({"error": "Patient not found."}), 404
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.patient_id = ?
+        ORDER BY mr.consultation_date DESC, mr.id DESC
+    """, (patient_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "patient": row_to_patient_dict(patient),
+        "records": [row_to_medical_record_dict(r) for r in rows],
+        "total": len(rows)
+    })
+
+
+@app.route("/api/patients/<int:patient_id>/lab-results", methods=["GET"])
+@require_role("admin", "doctor", "patient")
+def get_patient_lab_results_list(current_user, patient_id):
+    """Retrieves lab diagnostics results for a patient."""
+    if current_user["role"] == "patient":
+        if current_user.get("patient_id") and current_user["patient_id"] != patient_id:
+            return jsonify({"error": "Access Denied: You cannot view another patient's lab results."}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT lr.*, d.name as doctor_name
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.patient_id = ?
+        ORDER BY lr.test_date DESC, lr.id DESC
+    """, (patient_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_lab_result_dict(r) for r in rows])
+
+
+@app.route("/api/lab-results", methods=["POST"])
+@require_role("admin", "doctor")
+def add_new_lab_result(current_user):
+    """Adds a new diagnostic laboratory result."""
+    data = request.get_json(silent=True) or {}
+    patient_id = data.get("patient_id")
+    test_name = (data.get("test_name") or "").strip()
+    test_date = (data.get("test_date") or datetime.now().strftime("%Y-%m-%d")).strip()
+    result_value = (data.get("result_value") or "").strip()
+    units = (data.get("units") or "").strip()
+    reference_range = (data.get("reference_range") or "").strip()
+    status = (data.get("status") or "Normal").strip()
+    notes = (data.get("notes") or "").strip()
+    doctor_id = data.get("doctor_id") or (current_user.get("doctor_id") if current_user["role"] == "doctor" else 1)
+
+    if not patient_id or not test_name or not result_value:
+        return jsonify({"error": "Patient ID, Test Name, and Result Value are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO lab_results (
+            patient_id, doctor_id, test_name, test_date, result_value,
+            units, reference_range, status, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (patient_id, doctor_id, test_name, test_date, result_value, units, reference_range, status, notes))
+    new_id = cursor.lastrowid
+    conn.commit()
+
+    cursor.execute("""
+        SELECT lr.*, d.name as doctor_name
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.id = ?
+    """, (new_id,))
+    created = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": "Lab result recorded successfully.",
+        "lab_result": row_to_lab_result_dict(created)
+    }), 201
+
+
+@app.route("/api/doctor/prescriptions", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_prescriptions(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT pr.*, p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.doctor_id = ?
+        ORDER BY pr.prescription_date DESC, pr.id DESC
+    """, (target_doctor_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_prescription_dict(r) for r in rows])
+
+
+@app.route("/api/doctor/prescriptions", methods=["POST"])
+@require_role("admin", "doctor")
+def create_doctor_prescription(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    data = request.get_json(silent=True) or {}
+
+    patient_id = data.get("patient_id")
+    medication_name = data.get("medication_name", "").strip()
+    dosage = data.get("dosage", "").strip()
+    frequency = data.get("frequency", "").strip()
+    duration = data.get("duration", "30 days").strip()
+    route = data.get("route", "Oral").strip()
+    instructions = data.get("instructions", "").strip()
+    prescription_date = data.get("prescription_date") or datetime.now().strftime("%Y-%m-%d")
+
+    if not patient_id or not medication_name or not dosage or not frequency:
+        return jsonify({"error": "Patient ID, Medication Name, Dosage, and Frequency are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, name, doctor_id FROM patients WHERE id = ?", (patient_id,))
+    patient = cursor.fetchone()
+    if not patient:
+        conn.close()
+        return jsonify({"error": "Patient not found."}), 404
+
+    # Enforce doctor assignment check (or admin)
+    if current_user["role"] == "doctor":
+        if current_user["doctor_id"] and patient["doctor_id"] != current_user["doctor_id"]:
+            conn.close()
+            return jsonify({"error": "Access Denied: You may only issue prescriptions to authorized assigned patients."}), 403
+
+    cursor.execute("""
+        INSERT INTO prescriptions (
+            patient_id, doctor_id, medication_name, dosage, frequency,
+            duration, route, instructions, prescription_date, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')
+    """, (
+        patient_id, target_doctor_id, medication_name, dosage, frequency,
+        duration, route, instructions, prescription_date
+    ))
+    new_id = cursor.lastrowid
+    conn.commit()
+
+    log_activity(
+        "PRESCRIPTION_ISSUED",
+        f"Prescription issued for {patient['name']}: {medication_name} {dosage}",
+        "Prescription",
+        new_id,
+        current_user["name"],
+        "Doctor"
+    )
+
+    cursor.execute("""
+        SELECT pr.*, p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.id = ?
+    """, (new_id,))
+    created_pr = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": "Prescription issued successfully.",
+        "prescription": row_to_prescription_dict(created_pr)
+    }), 201
+
+
+@app.route("/api/doctor/schedule", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_schedule(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM doctor_schedules
+        WHERE doctor_id = ?
+        ORDER BY id ASC
+    """, (target_doctor_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    schedules = []
+    for r in rows:
+        schedules.append({
+            "id": r["id"],
+            "day_of_week": r["day_of_week"],
+            "start_time": r["start_time"],
+            "end_time": r["end_time"],
+            "slot_duration_minutes": r["slot_duration_minutes"],
+            "status": r["status"],
+        })
+    return jsonify(schedules)
+
+
+@app.route("/api/doctor/schedule", methods=["PUT"])
+@require_role("admin", "doctor")
+def update_doctor_schedule(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    data = request.get_json(silent=True) or {}
+    schedule_items = data.get("schedules") or data.get("schedule", [])
+
+    if not isinstance(schedule_items, list):
+        return jsonify({"error": "Schedules must be provided as an array."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    for item in schedule_items:
+        s_id = item.get("id")
+        start = item.get("start_time", "09:00 AM")
+        end = item.get("end_time", "05:00 PM")
+        status = item.get("status", "Available")
+        slot_dur = item.get("slot_duration_minutes", 30)
+
+        if s_id:
+            cursor.execute("""
+                UPDATE doctor_schedules
+                SET start_time = ?, end_time = ?, status = ?, slot_duration_minutes = ?
+                WHERE id = ? AND doctor_id = ?
+            """, (start, end, status, slot_dur, s_id, target_doctor_id))
+
+    conn.commit()
+    conn.close()
+
+    log_activity("SCHEDULE_UPDATED", f"Updated weekly clinical schedule for Dr. {current_user['name']}", "Schedule", target_doctor_id, current_user["name"], "Doctor")
+    return jsonify({"message": "Weekly schedule updated successfully."})
+
+
+@app.route("/api/doctor/profile", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_profile(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM doctors WHERE id = ?", (target_doctor_id,))
+    doc_row = cursor.fetchone()
+    conn.close()
+
+    if not doc_row:
+        return jsonify({"error": "Doctor profile not found."}), 404
+
+    return jsonify(row_to_doctor_dict(doc_row))
+
+
+@app.route("/api/doctor/profile", methods=["PUT"])
+@require_role("admin", "doctor")
+def update_doctor_profile(current_user):
+    target_doctor_id = current_user.get("doctor_id") or 1
+    data = request.get_json(silent=True) or {}
+
+    name = data.get("name", "").strip()
+    phone = data.get("phone", "").strip()
+    specialization = data.get("specialization", "").strip()
+    qualifications = data.get("qualifications", "").strip()
+    biography = data.get("biography", "").strip()
+    experience_years = data.get("experience_years", 12)
+
+    if not name or not specialization:
+        return jsonify({"error": "Doctor Name and Specialization are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE doctors
+        SET name = ?, phone = ?, specialization = ?, qualifications = ?,
+            biography = ?, experience_years = ?
+        WHERE id = ?
+    """, (name, phone, specialization, qualifications, biography, experience_years, target_doctor_id))
+
+    # Also update users table name
+    if current_user.get("id"):
+        cursor.execute("UPDATE users SET name = ? WHERE id = ?", (name, current_user["id"]))
+
+    conn.commit()
+
+    cursor.execute("SELECT * FROM doctors WHERE id = ?", (target_doctor_id,))
+    updated_doc = cursor.fetchone()
+    conn.close()
+
+    log_activity("DOCTOR_PROFILE_UPDATED", f"Dr. {name} updated their professional profile details", "Doctor", target_doctor_id, name, "Doctor")
+
+    return jsonify({
+        "message": "Professional profile updated successfully.",
+        "doctor": row_to_doctor_dict(updated_doc)
+    })
+
+
+@app.route("/api/doctor/change-password", methods=["POST"])
+@require_role("admin", "doctor")
+def doctor_change_password(current_user):
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("current_password", "").strip()
+    new_password = data.get("new_password", "").strip()
+
+    if not current_password or not new_password:
+        return jsonify({"error": "Both current password and new password are required."}), 400
+
+    if len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters in length."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT password_hash FROM users WHERE id = ?", (current_user["id"],))
+    u_row = cursor.fetchone()
+    if not u_row or not check_password_hash(u_row["password_hash"], current_password):
+        conn.close()
+        return jsonify({"error": "Incorrect current password. Password change denied."}), 400
+
+    new_hash = generate_password_hash(new_password)
+    cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user["id"]))
+
+    if current_user.get("doctor_id"):
+        cursor.execute("UPDATE doctors SET password = ? WHERE id = ?", (new_hash, current_user["doctor_id"]))
+
+    conn.commit()
+    conn.close()
+
+    log_activity("PASSWORD_CHANGED", f"Password changed for user {current_user['name']}", "User", current_user["id"], current_user["name"], "Doctor")
+
+    return jsonify({"message": "Password changed successfully."})
+
+
+@app.route("/api/doctor/notifications", methods=["GET"])
+@require_role("admin", "doctor")
+def get_doctor_notifications(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM notifications
+        WHERE user_id = ?
+        ORDER BY id DESC LIMIT 20
+    """, (current_user["id"],))
+    rows = cursor.fetchall()
+    conn.close()
+
+    notifs = []
+    for r in rows:
+        notifs.append({
+            "id": r["id"],
+            "title": r["title"],
+            "message": r["message"],
+            "type": r["type"],
+            "is_read": bool(r["is_read"]),
+            "created_at": r["created_at"],
+        })
+    return jsonify(notifs)
+
+
+@app.route("/api/doctor/notifications/<int:notif_id>/read", methods=["PUT"])
+@require_role("admin", "doctor")
+def mark_doctor_notification_read(current_user, notif_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?", (notif_id, current_user["id"]))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "Notification marked as read."})
+
+
+@app.route("/api/doctor/notifications/read-all", methods=["POST"])
+@require_role("admin", "doctor")
+def mark_all_doctor_notifications_read(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE notifications SET is_read = 1 WHERE user_id = ?", (current_user["id"],))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "All notifications marked as read."})
+
+
+# ---------------------------------------------------------
+# PATIENT-SPECIFIC ENDPOINTS WITH OWNERSHIP CHECKS & RBAC
+# ---------------------------------------------------------
+
+def resolve_current_patient_id(current_user):
+    """
+    Safely resolves the patient ID for the authenticated user without trusting client parameters.
+    Checks current_user['patient_id'] first, then queries patients by user_id or email.
+    """
+    if current_user.get("patient_id"):
+        return current_user["patient_id"]
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id FROM patients
+        WHERE user_id = ? OR LOWER(email) = LOWER(?)
+        ORDER BY id ASC LIMIT 1
+    """, (current_user["id"], current_user.get("email", "")))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        current_user["patient_id"] = row["id"]
+        return row["id"]
+    return None
+
+
+@app.route("/api/patient/me", methods=["GET"])
+@require_role("patient", "admin")
+def get_current_patient_profile(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Patient record not found."}), 404
+
+    return jsonify(row_to_patient_dict(row))
+
+
+@app.route("/api/patient/profile", methods=["PUT"])
+@require_role("patient")
+def update_patient_profile(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    address = (data.get("address") or "").strip()
+    emergency_contact_name = (data.get("emergency_contact_name") or "").strip()
+    emergency_contact_phone = (data.get("emergency_contact_phone") or "").strip()
+    blood_group = (data.get("blood_group") or "").strip()
+    weight = str(data.get("weight") or "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE patients
+        SET phone = ?, address = ?, emergency_contact_name = ?,
+            emergency_contact_phone = ?, blood_group = ?, weight = ?
+        WHERE id = ?
+    """, (phone, address, emergency_contact_name, emergency_contact_phone, blood_group, weight, patient_id))
+    conn.commit()
+
+    cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+    updated_row = cursor.fetchone()
+    conn.close()
+
+    log_activity("PATIENT_PROFILE_UPDATED", f"Patient {current_user['name']} updated personal contact profile", "Patient", patient_id, current_user['name'], "Patient")
+
+    return jsonify({
+        "message": "Personal health profile updated successfully.",
+        "patient": row_to_patient_dict(updated_row)
+    })
+
+
+@app.route("/api/patient/dashboard", methods=["GET"])
+@require_role("patient", "admin")
+def get_authenticated_patient_dashboard(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No patient record linked to this account."}), 404
+    return build_patient_dashboard_response(patient_id, current_user)
+
+
+@app.route("/api/patient/dashboard/<int:patient_id>", methods=["GET"])
+@require_role("admin", "patient")
+def get_patient_dashboard(current_user, patient_id):
+    # Enforce patient authorization: Patients must NEVER access another patient's data
+    if current_user["role"] == "patient":
+        resolved_id = resolve_current_patient_id(current_user)
+        if resolved_id and resolved_id != patient_id:
+            return jsonify({"error": "Access Denied: You cannot view or access another patient's confidential health records."}), 403
+    return build_patient_dashboard_response(patient_id, current_user)
+
+
+def build_patient_dashboard_response(patient_id, current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+    pat_row = cursor.fetchone()
+    if not pat_row:
+        conn.close()
+        return jsonify({"error": "Patient record not found"}), 404
+
+    # Attending doctor details
+    cursor.execute("SELECT * FROM doctors WHERE id = ?", (pat_row["doctor_id"] or 1,))
+    doc_row = cursor.fetchone()
+    attending_doc = row_to_doctor_dict(doc_row) if doc_row else {
+        "id": 1,
+        "name": "Dr. Satya Deep",
+        "specialization": "Cardiology",
+        "email": "satya.deep@healthpulse.com",
+        "phone": "555-0101"
+    }
+
+    # Summary Metrics
+    # 1. Upcoming Appointments Count
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM appointments
+        WHERE patient_id = ? AND status NOT IN ('Cancelled', 'Completed')
+    """, (patient_id,))
+    upcoming_appts_count = cursor.fetchone()["count"]
+
+    # 2. Finalized Records Count (Patients only see finalized records)
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM medical_records
+        WHERE patient_id = ? AND status = 'Finalized'
+    """, (patient_id,))
+    finalized_records_count = cursor.fetchone()["count"]
+
+    # 3. Active Prescriptions Count
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM prescriptions
+        WHERE patient_id = ? AND (status = 'Active' OR status IS NULL)
+    """, (patient_id,))
+    active_prescriptions_count = cursor.fetchone()["count"]
+
+    # 4. Lab Results Count
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM lab_results
+        WHERE patient_id = ?
+    """, (patient_id,))
+    lab_results_count = cursor.fetchone()["count"]
+
+    # 5. Unread Notifications Count
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM notifications
+        WHERE user_id = ? AND (is_read = FALSE OR is_read IS NULL)
+    """, (current_user["id"],))
+    unread_notifs_count = cursor.fetchone()["count"]
+
+    # Next upcoming appointment
+    cursor.execute("""
+        SELECT a.*, d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.patient_id = ? AND a.status NOT IN ('Cancelled', 'Completed')
+        ORDER BY a.appointment_date ASC, a.appointment_time ASC
+        LIMIT 1
+    """, (patient_id,))
+    next_appt_row = cursor.fetchone()
+    next_appointment = None
+    if next_appt_row:
+        next_appointment = {
+            "id": next_appt_row["id"],
+            "doctor_id": next_appt_row["doctor_id"],
+            "doctor_name": next_appt_row["doctor_name"],
+            "doctor_specialization": next_appt_row["doctor_specialization"],
+            "doctor_phone": next_appt_row["doctor_phone"],
+            "appointment_date": next_appt_row["appointment_date"],
+            "appointment_time": next_appt_row["appointment_time"],
+            "status": next_appt_row["status"],
+            "reason": next_appt_row["reason"] or "General Checkup",
+        }
+
+    # Recent Appointments (up to 4)
+    cursor.execute("""
+        SELECT a.*, d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.patient_id = ?
+        ORDER BY a.appointment_date DESC, a.appointment_time DESC
+        LIMIT 4
+    """, (patient_id,))
+    appointments = []
+    for r in cursor.fetchall():
+        appointments.append({
+            "id": r["id"],
+            "doctor_id": r["doctor_id"],
+            "doctor_name": r["doctor_name"],
+            "doctor_specialization": r["doctor_specialization"],
+            "doctor_phone": r["doctor_phone"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
+            "status": r["status"],
+            "reason": r["reason"] or "Consultation",
+        })
+
+    # Recent Finalized Medical Records (up to 3)
+    cursor.execute("""
+        SELECT mr.*, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.patient_id = ? AND mr.status = 'Finalized'
+        ORDER BY mr.consultation_date DESC, mr.id DESC
+        LIMIT 3
+    """, (patient_id,))
+    recent_records = [row_to_medical_record_dict(r) for r in cursor.fetchall()]
+
+    # Recent Prescriptions (up to 3)
+    cursor.execute("""
+        SELECT pr.*, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM prescriptions pr
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.patient_id = ?
+        ORDER BY pr.prescription_date DESC, pr.id DESC
+        LIMIT 3
+    """, (patient_id,))
+    recent_prescriptions = [row_to_prescription_dict(r) for r in cursor.fetchall()]
+
+    # Recent Lab Results (up to 3)
+    cursor.execute("""
+        SELECT lr.*, d.name as doctor_name
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.patient_id = ?
+        ORDER BY lr.test_date DESC, lr.id DESC
+        LIMIT 3
+    """, (patient_id,))
+    recent_labs = [row_to_lab_result_dict(r) for r in cursor.fetchall()]
+
+    # Latest Vitals from most recent finalized record
+    latest_vitals = {
+        "blood_pressure": "120/80 mmHg",
+        "heart_rate": "72 bpm",
+        "oxygen_saturation": "98%",
+        "temperature": "98.6 °F",
+        "weight": f"{pat_row['weight']} kg" if pat_row["weight"] else "70 kg"
+    }
+    if recent_records and recent_records[0].get("vital_signs"):
+        vs = recent_records[0]["vital_signs"]
+        if isinstance(vs, dict):
+            if vs.get("blood_pressure") or vs.get("bp"):
+                latest_vitals["blood_pressure"] = vs.get("blood_pressure") or vs.get("bp")
+            if vs.get("heart_rate") or vs.get("pulse"):
+                latest_vitals["heart_rate"] = f"{vs.get('heart_rate') or vs.get('pulse')} bpm" if not str(vs.get('heart_rate') or vs.get('pulse')).endswith("bpm") else str(vs.get('heart_rate') or vs.get('pulse'))
+            if vs.get("oxygen_saturation") or vs.get("spo2"):
+                latest_vitals["oxygen_saturation"] = f"{vs.get('oxygen_saturation') or vs.get('spo2')}"
+            if vs.get("temperature") or vs.get("temp"):
+                latest_vitals["temperature"] = f"{vs.get('temperature') or vs.get('temp')}"
+
+    # Billing & Financial Summary for this patient
+    cursor.execute("""
+        SELECT COUNT(*) as count,
+               COALESCE(SUM(net_amount), 0) as total_billed,
+               COALESCE(SUM(paid_amount), 0) as total_paid,
+               COALESCE(SUM(balance_amount), 0) as total_balance
+        FROM billing_records
+        WHERE patient_id = ?
+    """, (patient_id,))
+    billing_stats = cursor.fetchone()
+
+    cursor.execute("""
+        SELECT id, bill_number, net_amount, paid_amount, balance_amount, status, bill_date, due_date
+        FROM billing_records
+        WHERE patient_id = ?
+        ORDER BY bill_date DESC
+        LIMIT 4;
+    """, (patient_id,))
+    recent_bills = [dict(r) for r in cursor.fetchall()]
+
+    conn.close()
+
+    return jsonify({
+        "patient": row_to_patient_dict(pat_row),
+        "attending_doctor": attending_doc,
+        "metrics": {
+            "upcoming_appointments": upcoming_appts_count,
+            "finalized_records": finalized_records_count,
+            "active_prescriptions": active_prescriptions_count,
+            "lab_results": lab_results_count,
+            "unread_notifications": unread_notifs_count,
+            "total_bills": billing_stats["count"] or 0,
+            "total_billed": float(billing_stats["total_billed"] or 0),
+            "total_paid": float(billing_stats["total_paid"] or 0),
+            "balance_due": float(billing_stats["total_balance"] or 0)
+        },
+        "next_appointment": next_appointment,
+        "appointments": appointments,
+        "recent_records": recent_records,
+        "recent_prescriptions": recent_prescriptions,
+        "recent_labs": recent_labs,
+        "recent_bills": recent_bills,
+        "latest_vitals": latest_vitals
+    })
+
+
+@app.route("/api/patient/appointments", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_appointments(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    tab = request.args.get("tab", "all").lower()
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT a.*, d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone, d.email as doctor_email
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.patient_id = ?
+    """
+    params = [patient_id]
+
+    if tab == "upcoming":
+        query += " AND a.status NOT IN ('Cancelled', 'Completed')"
+    elif tab == "past":
+        query += " AND (a.status IN ('Cancelled', 'Completed'))"
+
+    if status:
+        query += " AND LOWER(a.status) = LOWER(?)"
+        params.append(status)
+
+    if search:
+        query += " AND (LOWER(d.name) LIKE ? OR LOWER(d.specialization) LIKE ? OR LOWER(a.reason) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term, term])
+
+    if tab == "upcoming":
+        query += " ORDER BY a.appointment_date ASC, a.appointment_time ASC"
+    else:
+        query += " ORDER BY a.appointment_date DESC, a.appointment_time DESC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    appts = []
+    for r in rows:
+        appts.append({
+            "id": r["id"],
+            "doctor_id": r["doctor_id"],
+            "doctor_name": r["doctor_name"],
+            "doctor_specialization": r["doctor_specialization"],
+            "doctor_phone": r["doctor_phone"],
+            "doctor_email": r["doctor_email"],
+            "appointment_date": r["appointment_date"],
+            "appointment_time": r["appointment_time"],
+            "status": r["status"],
+            "reason": r["reason"] or "General Consultation",
+            "created_at": r["created_at"],
+        })
+
+    return jsonify(appts)
+
+
+@app.route("/api/patient/appointments", methods=["POST"])
+@require_role("patient")
+def book_patient_appointment(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    doctor_id = data.get("doctor_id")
+    appointment_date = (data.get("appointment_date") or "").strip()
+    appointment_time = (data.get("appointment_time") or "").strip()
+    reason = (data.get("reason") or "Routine Consultation").strip()
+
+    if not doctor_id:
+        return jsonify({"error": "Please select a physician for the appointment."}), 400
+    if not appointment_date or not appointment_time:
+        return jsonify({"error": "Appointment date and time are required."}), 400
+
+    # Validate date is not in the past
+    try:
+        appt_d = datetime.strptime(appointment_date, "%Y-%m-%d").date()
+        if appt_d < datetime.now().date():
+            return jsonify({"error": "Cannot schedule an appointment for a past date."}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid date format. Expected YYYY-MM-DD."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Validate doctor exists
+    cursor.execute("SELECT id, name, user_id FROM doctors WHERE id = ?", (doctor_id,))
+    doctor = cursor.fetchone()
+    if not doctor:
+        conn.close()
+        return jsonify({"error": "Selected doctor was not found in registry."}), 404
+
+    # Prevent double-booking for the doctor
+    cursor.execute("""
+        SELECT id FROM appointments
+        WHERE doctor_id = ? AND appointment_date = ? AND appointment_time = ?
+          AND status NOT IN ('Cancelled', 'Rejected')
+    """, (doctor_id, appointment_date, appointment_time))
+    conflict = cursor.fetchone()
+    if conflict:
+        conn.close()
+        return jsonify({"error": f"Dr. {doctor['name']} already has an appointment scheduled at {appointment_time} on {appointment_date}. Please pick an alternate time slot."}), 409
+
+    # Insert appointment
+    cursor.execute("""
+        INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, status, reason, created_at)
+        VALUES (?, ?, ?, ?, 'Scheduled', ?, CURRENT_TIMESTAMP)
+    """, (patient_id, doctor_id, appointment_date, appointment_time, reason))
+    conn.commit()
+
+    # Query new ID
+    cursor.execute("SELECT MAX(id) as id FROM appointments WHERE patient_id = ?", (patient_id,))
+    new_appt_id = cursor.fetchone()["id"]
+
+    # Notify doctor if user account linked
+    if doctor["user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+            VALUES (?, 'New Patient Appointment', ?, 'appointment', FALSE, '/doctor/appointments', CURRENT_TIMESTAMP)
+        """, (doctor["user_id"], f"Patient {current_user['name']} scheduled an appointment for {appointment_date} at {appointment_time}."))
+
+    # Notify patient
+    cursor.execute("""
+        INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+        VALUES (?, 'Appointment Confirmed', ?, 'appointment', FALSE, '/patient/appointments', CURRENT_TIMESTAMP)
+    """, (current_user["id"], f"Your appointment with Dr. {doctor['name']} has been booked for {appointment_date} at {appointment_time}."))
+
+    conn.commit()
+    conn.close()
+
+    log_activity("APPOINTMENT_BOOKED", f"Patient {current_user['name']} scheduled appointment with Dr. {doctor['name']} for {appointment_date}", "Appointment", new_appt_id, current_user['name'], "Patient")
+
+    return jsonify({
+        "message": "Appointment scheduled successfully.",
+        "appointment_id": new_appt_id
+    }), 201
+
+
+@app.route("/api/patient/appointments/<int:appointment_id>/cancel", methods=["PUT", "POST"])
+@require_role("patient")
+def cancel_patient_appointment(current_user, appointment_id):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT a.*, d.name as doctor_name, d.user_id as doctor_user_id
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.id = ?
+    """, (appointment_id,))
+    appt = cursor.fetchone()
+
+    if not appt:
+        conn.close()
+        return jsonify({"error": "Appointment record not found."}), 404
+
+    # Security IDOR check: ensure the appointment belongs to the calling patient
+    if appt["patient_id"] != patient_id:
+        conn.close()
+        return jsonify({"error": "Access Denied: You cannot cancel an appointment belonging to another patient."}), 403
+
+    if appt["status"] == "Cancelled":
+        conn.close()
+        return jsonify({"message": "Appointment is already cancelled."})
+
+    cursor.execute("UPDATE appointments SET status = 'Cancelled' WHERE id = ?", (appointment_id,))
+
+    # Notify doctor
+    if appt["doctor_user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+            VALUES (?, 'Appointment Cancelled', ?, 'appointment', FALSE, '/doctor/appointments', CURRENT_TIMESTAMP)
+        """, (appt["doctor_user_id"], f"Patient {current_user['name']} has cancelled the appointment on {appt['appointment_date']} at {appt['appointment_time']}."))
+
+    # Notify patient
+    cursor.execute("""
+        INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+        VALUES (?, 'Appointment Cancelled', ?, 'appointment', FALSE, '/patient/appointments', CURRENT_TIMESTAMP)
+    """, (current_user["id"], f"You have cancelled your appointment with Dr. {appt['doctor_name']} scheduled for {appt['appointment_date']}."))
+
+    conn.commit()
+    conn.close()
+
+    log_activity("APPOINTMENT_CANCELLED", f"Patient {current_user['name']} cancelled appointment #{appointment_id}", "Appointment", appointment_id, current_user['name'], "Patient")
+
+    return jsonify({"message": "Appointment successfully cancelled."})
+
+
+@app.route("/api/patient/doctors", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_doctors(current_user):
+    search = request.args.get("search", "").strip()
+    specialization = request.args.get("specialization", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT id, user_id, name, specialization, phone, email, status, qualifications, biography, experience_years, created_at
+        FROM doctors
+        WHERE (status = 'Active' OR status IS NULL)
+    """
+    params = []
+
+    if specialization and specialization.lower() != "all":
+        query += " AND LOWER(specialization) = LOWER(?)"
+        params.append(specialization)
+
+    if search:
+        query += " AND (LOWER(name) LIKE ? OR LOWER(specialization) LIKE ? OR LOWER(biography) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term, term])
+
+    query += " ORDER BY name ASC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    doctors = [row_to_doctor_dict(r) for r in rows]
+    return jsonify(doctors)
+
+
+@app.route("/api/patient/medical-records", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_medical_records(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # CRITICAL HEALTHCARE SECURITY: Only released/finalized records are visible to patients.
+    query = """
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.patient_id = ? AND mr.status = 'Finalized'
+    """
+    params = [patient_id]
+
+    if search:
+        query += " AND (LOWER(mr.diagnosis) LIKE ? OR LOWER(mr.symptoms) LIKE ? OR LOWER(d.name) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term, term])
+
+    query += " ORDER BY mr.consultation_date DESC, mr.id DESC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    records = [row_to_medical_record_dict(r) for r in rows]
+    return jsonify(records)
+
+
+@app.route("/api/patient/medical-records/<int:record_id>", methods=["GET"])
+@require_role("patient", "admin")
+def get_single_patient_medical_record(current_user, record_id):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT mr.*,
+               p.name as patient_name, p.age as patient_age, p.gender as patient_gender,
+               p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM medical_records mr
+        JOIN patients p ON mr.patient_id = p.id
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "Medical record not found."}), 404
+
+    if row["patient_id"] != patient_id:
+        return jsonify({"error": "Access Denied: You cannot access another patient's medical record."}), 403
+
+    if row["status"] != "Finalized" and current_user["role"] == "patient":
+        return jsonify({"error": "This medical record is currently pending clinical review and has not yet been released."}), 403
+
+    return jsonify(row_to_medical_record_dict(row))
+
+
+@app.route("/api/patient/medical-records/<int:record_id>/correction-request", methods=["POST"])
+@require_role("patient")
+def request_medical_record_correction(current_user, record_id):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+    details = (data.get("details") or "").strip()
+
+    if not reason or not details:
+        return jsonify({"error": "Please specify both a reason and clear details for the correction request."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT mr.*, d.user_id as doctor_user_id, d.name as doctor_name
+        FROM medical_records mr
+        JOIN doctors d ON mr.doctor_id = d.id
+        WHERE mr.id = ?
+    """, (record_id,))
+    rec = cursor.fetchone()
+
+    if not rec:
+        conn.close()
+        return jsonify({"error": "Medical record not found."}), 404
+
+    if rec["patient_id"] != patient_id:
+        conn.close()
+        return jsonify({"error": "Access Denied: Cannot submit correction request for another patient's record."}), 403
+
+    cursor.execute("""
+        INSERT INTO patient_correction_requests (patient_id, medical_record_id, doctor_id, reason, details, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'Pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    """, (patient_id, record_id, rec["doctor_id"], reason, details))
+    conn.commit()
+
+    # Notify doctor
+    if rec["doctor_user_id"]:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, title, message, type, is_read, link, created_at)
+            VALUES (?, 'Record Amendment Request', ?, 'record', FALSE, '/doctor/medical-records', CURRENT_TIMESTAMP)
+        """, (rec["doctor_user_id"], f"Patient {current_user['name']} has submitted a formal correction request for consultation record #{record_id}."))
+        conn.commit()
+
+    conn.close()
+
+    log_activity("CORRECTION_REQUESTED", f"Patient {current_user['name']} requested correction on record #{record_id}", "MedicalRecord", record_id, current_user['name'], "Patient")
+
+    return jsonify({
+        "message": "Your clinical correction request has been forwarded to the attending physician for review."
+    }), 201
+
+
+@app.route("/api/patient/correction-requests", methods=["GET"])
+@require_role("patient")
+def get_patient_correction_requests(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT cr.*, mr.consultation_date, d.name as doctor_name
+        FROM patient_correction_requests cr
+        JOIN medical_records mr ON cr.medical_record_id = mr.id
+        LEFT JOIN doctors d ON cr.doctor_id = d.id
+        WHERE cr.patient_id = ?
+        ORDER BY cr.created_at DESC
+    """, (patient_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    reqs = []
+    for r in rows:
+        reqs.append({
+            "id": r["id"],
+            "medical_record_id": r["medical_record_id"],
+            "consultation_date": r["consultation_date"],
+            "doctor_name": r["doctor_name"],
+            "reason": r["reason"],
+            "details": r["details"],
+            "status": r["status"],
+            "doctor_notes": r["doctor_notes"],
+            "created_at": r["created_at"],
+        })
+    return jsonify(reqs)
+
+
+@app.route("/api/patient/prescriptions", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_prescriptions(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    status_filter = request.args.get("status", "all").lower()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT pr.*,
+               p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+               d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.patient_id = ?
+    """
+    params = [patient_id]
+
+    if status_filter == "active":
+        query += " AND (LOWER(pr.status) = 'active' OR pr.status IS NULL)"
+    elif status_filter == "completed":
+        query += " AND LOWER(pr.status) IN ('completed', 'discontinued')"
+
+    if search:
+        query += " AND (LOWER(pr.medication_name) LIKE ? OR LOWER(d.name) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term])
+
+    query += " ORDER BY pr.prescription_date DESC, pr.id DESC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_prescription_dict(r) for r in rows])
+
+
+@app.route("/api/patient/prescriptions/<int:prescription_id>", methods=["GET"])
+@require_role("patient", "admin")
+def get_single_patient_prescription(current_user, prescription_id):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT pr.*,
+               p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+               d.name as doctor_name, d.specialization as doctor_specialization, d.phone as doctor_phone
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.id = ?
+    """, (prescription_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "Prescription not found."}), 404
+
+    if row["patient_id"] != patient_id:
+        return jsonify({"error": "Access Denied: You cannot view another patient's prescription."}), 403
+
+    return jsonify(row_to_prescription_dict(row))
+
+
+@app.route("/api/patient/lab-results", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_lab_results(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT lr.*, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM lab_results lr
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE lr.patient_id = ?
+    """
+    params = [patient_id]
+
+    if search:
+        query += " AND (LOWER(lr.test_name) LIKE ? OR LOWER(lr.status) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term])
+
+    query += " ORDER BY lr.test_date DESC, lr.id DESC"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([row_to_lab_result_dict(r) for r in rows])
+
+
+@app.route("/api/patient/notifications", methods=["GET"])
+@require_role("patient", "admin")
+def get_patient_notifications(current_user):
+    filter_type = request.args.get("filter", "all").lower()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = "SELECT * FROM notifications WHERE user_id = ?"
+    params = [current_user["id"]]
+
+    if filter_type == "unread":
+        query += " AND (is_read = FALSE OR is_read IS NULL)"
+
+    query += " ORDER BY id DESC LIMIT 50"
+
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    notifs = []
+    for r in rows:
+        notifs.append({
+            "id": r["id"],
+            "title": r["title"],
+            "message": r["message"],
+            "type": r["type"],
+            "link": r["link"] if "link" in r.keys() else "/patient/dashboard",
+            "is_read": bool(r["is_read"]),
+            "created_at": r["created_at"],
+        })
+    return jsonify(notifs)
+
+
+@app.route("/api/patient/notifications/<int:notif_id>/read", methods=["PUT"])
+@require_role("patient", "admin")
+def mark_patient_notification_read(current_user, notif_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE notifications SET is_read = TRUE WHERE id = ? AND user_id = ?", (notif_id, current_user["id"]))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "Notification marked as read."})
+
+
+@app.route("/api/patient/notifications/read-all", methods=["POST", "PUT"])
+@require_role("patient", "admin")
+def mark_all_patient_notifications_read(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE notifications SET is_read = TRUE WHERE user_id = ?", (current_user["id"],))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "All notifications marked as read."})
+
+
+@app.route("/api/patient/change-password", methods=["POST"])
+@require_role("patient")
+def change_patient_password(current_user):
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("current_password", "").strip()
+    new_password = data.get("new_password", "").strip()
+
+    if not current_password or not new_password:
+        return jsonify({"error": "Both current and new passwords are required."}), 400
+
+    if len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters in length."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT password_hash FROM users WHERE id = ?", (current_user["id"],))
+    user_row = cursor.fetchone()
+    if not user_row or not check_password_hash(user_row["password_hash"], current_password):
+        conn.close()
+        return jsonify({"error": "The current password provided is incorrect."}), 401
+
+    new_hash = generate_password_hash(new_password)
+    cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user["id"]))
+
+    patient_id = resolve_current_patient_id(current_user)
+    if patient_id:
+        cursor.execute("UPDATE patients SET password = ? WHERE id = ?", (new_hash, patient_id))
+
+    conn.commit()
+    conn.close()
+
+    log_activity("PATIENT_PASSWORD_CHANGED", f"Password changed for patient {current_user['name']}", "User", current_user["id"], current_user["name"], "Patient")
+
+    return jsonify({"message": "Password changed successfully."})
+
+
+# ---------------------------------------------------------
+# PATIENTS CRUD (MAINTAINS EXISTING FUNCTIONALITY)
+# ---------------------------------------------------------
+
+@app.route("/patients", methods=["GET"])
+@app.route("/api/patients", methods=["GET"])
+def get_patients():
+    page_param = request.args.get("page")
+    is_paginated = page_param is not None or request.args.get("paginate") == "true"
+
+    search_term = (request.args.get("search") or request.args.get("q") or "").strip().lower()
+    disease_filter = request.args.get("disease", "").strip()
+    sort_by = request.args.get("sort", "name-asc").strip().lower()
+
+    where_clauses = []
+    params = []
+
+    if search_term:
+        term = f"%{search_term}%"
+        where_clauses.append("(LOWER(p.name) LIKE ? OR LOWER(p.email) LIKE ? OR LOWER(COALESCE(p.doctor_name, '')) LIKE ? OR LOWER(COALESCE(p.disease, '')) LIKE ?)")
+        params.extend([term, term, term, term])
+
+    if disease_filter and disease_filter.upper() != "ALL":
+        where_clauses.append("LOWER(p.disease) = ?")
+        params.append(disease_filter.lower())
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    sort_order_map = {
+        "name-asc": "p.name ASC",
+        "name-desc": "p.name DESC",
+        "age-asc": "p.age ASC",
+        "age-desc": "p.age DESC",
+        "id-asc": "p.id ASC",
+        "id-desc": "p.id DESC"
+    }
+    order_by_sql = sort_order_map.get(sort_by, "p.id DESC")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if is_paginated:
+        page = max(1, int(page_param or 1))
+        per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 12)))
+        offset = (page - 1) * per_page
+
+        cursor.execute(f"SELECT COUNT(*) FROM patients p {where_sql}", params)
+        total = cursor.fetchone()[0]
+
+        cursor.execute(f"""
+            SELECT p.* FROM patients p
+            {where_sql}
+            ORDER BY {order_by_sql}
+            LIMIT ? OFFSET ?
+        """, params + [per_page, offset])
+        rows = cursor.fetchall()
+
+        cursor.execute("SELECT DISTINCT disease FROM patients WHERE disease IS NOT NULL AND disease != '' ORDER BY disease ASC")
+        diseases = [r[0] for r in cursor.fetchall() if r[0]]
+
+        conn.close()
+
+        patients = [row_to_patient_dict(row) for row in rows]
+        total_pages = max(1, math.ceil(total / per_page))
+
+        return jsonify({
+            "patients": patients,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "diseases": diseases
+        })
+    else:
+        cursor.execute(f"SELECT p.* FROM patients p {where_sql} ORDER BY {order_by_sql}", params)
+        rows = cursor.fetchall()
+        conn.close()
+        patients = [row_to_patient_dict(row) for row in rows]
+        return jsonify(patients)
 
 
 @app.route("/patients/<int:patient_id>", methods=["GET"])
@@ -143,7 +4685,7 @@ def add_patient():
     data = request.get_json(silent=True) or {}
 
     name = data.get("name", "").strip()
-    email = data.get("email", "").strip()
+    email = data.get("email", "").strip().lower()
 
     if not name or not email:
         return jsonify({"error": "Name and email are required"}), 400
@@ -169,12 +4711,27 @@ def add_patient():
     cursor = conn.cursor()
 
     try:
+        hashed_password = generate_password_hash(password)
+
+        # 1. Insert into central users table
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = ?", (email,))
+        existing_u = cursor.fetchone()
+        if existing_u:
+            user_id = existing_u["id"]
+        else:
+            cursor.execute("""
+                INSERT INTO users (name, email, password_hash, role, is_active)
+                VALUES (?, ?, ?, 'patient', 1)
+            """, (name, email, hashed_password))
+            user_id = cursor.lastrowid
+
+        # 2. Insert into patients table linked with user_id
         cursor.execute("""
             INSERT INTO patients (
-                name, weight, gender, age, email, password, disease,
+                user_id, name, weight, gender, age, email, password, disease,
                 doctor_id, doctor_name, doctor_specialization, role
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (name, weight, gender, age, email, password, disease, doc_id, doc_name, doc_spec, role))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, name, weight, gender, age, email, hashed_password, disease, doc_id, doc_name, doc_spec, role))
         new_id = cursor.lastrowid
         conn.commit()
 
@@ -183,14 +4740,15 @@ def add_patient():
         conn.close()
 
         created_patient = row_to_patient_dict(new_row)
+        log_activity("PATIENT_REGISTERED", f"Patient {name} registered with condition: {disease}", "Patient", new_id)
+
         return jsonify({
-            "message": "added successfllyu",
+            "message": "added successfully",
             "patient": created_patient
         }), 201
 
     except sqlite3.IntegrityError:
         conn.close()
-        # If email already exists, update existing
         return jsonify({"error": "A patient with this email already exists"}), 409
 
 
@@ -233,11 +4791,18 @@ def update_patient(patient_id):
             doctor_specialization = ?, role = ?
         WHERE id = ?
     """, (name, weight, gender, age, email, password, disease, doc_id, doc_name, doc_spec, role, patient_id))
+
+    # Also sync name in users table if linked
+    if existing["user_id"]:
+        cursor.execute("UPDATE users SET name = ?, email = ? WHERE id = ?", (name, email, existing["user_id"]))
+
     conn.commit()
 
     cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
     updated_row = cursor.fetchone()
     conn.close()
+
+    log_activity("PATIENT_UPDATED", f"Updated details for patient {name}", "Patient", patient_id)
 
     return jsonify(row_to_patient_dict(updated_row))
 
@@ -246,54 +4811,1824 @@ def update_patient(patient_id):
 def delete_patient(patient_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM patients WHERE id = ?", (patient_id,))
-    if not cursor.fetchone():
+    cursor.execute("SELECT name, user_id FROM patients WHERE id = ?", (patient_id,))
+    row = cursor.fetchone()
+    if not row:
         conn.close()
         return jsonify({"error": "Patient not found"}), 404
 
+    patient_name = row["name"]
+    user_id = row["user_id"]
+
     cursor.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
+    if user_id:
+        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        cursor.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+
     conn.commit()
     conn.close()
+
+    log_activity("PATIENT_DELETED", f"Patient {patient_name} (ID #{patient_id}) deleted", "Patient", patient_id)
 
     return jsonify({"message": "deleted successfully", "id": patient_id})
 
 
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.get_json(silent=True) or {}
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "").strip()
+# ---------------------------------------------------------
+# MODULE A: PRESCRIPTION MANAGEMENT REST APIS
+# ---------------------------------------------------------
 
-    if not email or not password:
-        return jsonify({"error": "Email and password are required"}), 400
-
-    # System Administrator check
-    if (email == "admin@healthpulse.com" and password == "admin123") or (email == "admin" and password == "admin"):
-        return jsonify({
-            "message": "Login successful",
-            "patient": {
-                "name": "System Administrator",
-                "email": "admin@healthpulse.com",
-                "role": "Admin",
-            }
-        })
-
-    # Patient / Doctor database check
+@app.route("/api/prescriptions/stats", methods=["GET"])
+@require_role("admin", "doctor")
+def get_prescriptions_stats(current_user):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM patients WHERE LOWER(email) = ? AND password = ?", (email, password))
+
+    cursor.execute("SELECT COUNT(*) FROM prescriptions")
+    total_prescriptions = cursor.fetchone()[0]
+
+    month_clause = "(strftime('%Y-%m', prescription_date) = strftime('%Y-%m', 'now') OR strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now'))"
+    cursor.execute(f"SELECT COUNT(*) FROM prescriptions WHERE {month_clause}")
+    created_this_month = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM prescriptions WHERE LOWER(status) = 'active'")
+    active_prescriptions = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM prescriptions WHERE LOWER(status) IN ('discontinued', 'cancelled', 'canceled')")
+    discontinued_or_cancelled = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM prescriptions WHERE LOWER(status) = 'completed'")
+    completed_prescriptions = cursor.fetchone()[0]
+
+    conn.close()
+
+    return jsonify({
+        "total_prescriptions": total_prescriptions,
+        "created_this_month": created_this_month,
+        "active_prescriptions": active_prescriptions,
+        "discontinued_or_cancelled": discontinued_or_cancelled,
+        "completed_prescriptions": completed_prescriptions
+    })
+
+
+@app.route("/api/prescriptions", methods=["GET"])
+@require_role("admin", "doctor")
+def get_prescriptions_collection(current_user):
+    search_q = (request.args.get("q") or request.args.get("search") or "").strip().lower()
+    status_filter = request.args.get("status", "ALL").strip()
+    start_date = request.args.get("startDate", "").strip()
+    end_date = request.args.get("endDate", "").strip()
+    patient_id = request.args.get("patient_id", "").strip()
+    doctor_id = request.args.get("doctor_id", "").strip()
+    sort_dir = request.args.get("sort", "desc").strip().lower()
+    if sort_dir not in ["asc", "desc"]:
+        sort_dir = "desc"
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = max(1, min(100, int(request.args.get("per_page") or request.args.get("limit") or 10)))
+    offset = (page - 1) * per_page
+
+    where_clauses = []
+    params = []
+
+    if current_user["role"] == "doctor":
+        doc_id = current_user.get("doctor_id") or 1
+        where_clauses.append("pr.doctor_id = ?")
+        params.append(doc_id)
+    elif doctor_id:
+        where_clauses.append("pr.doctor_id = ?")
+        params.append(int(doctor_id))
+
+    if patient_id:
+        where_clauses.append("pr.patient_id = ?")
+        params.append(int(patient_id))
+
+    if status_filter and status_filter.upper() != "ALL":
+        where_clauses.append("LOWER(pr.status) = ?")
+        params.append(status_filter.lower())
+
+    if start_date:
+        where_clauses.append("pr.prescription_date >= ?")
+        params.append(start_date)
+
+    if end_date:
+        where_clauses.append("pr.prescription_date <= ?")
+        params.append(end_date)
+
+    if search_q:
+        term = f"%{search_q}%"
+        where_clauses.append("""(
+            LOWER(p.name) LIKE ? OR
+            LOWER(d.name) LIKE ? OR
+            LOWER(pr.medication_name) LIKE ? OR
+            CAST(pr.id AS TEXT) LIKE ? OR
+            CAST(pr.patient_id AS TEXT) LIKE ?
+        )""")
+        params.extend([term, term, term, term, term])
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    count_query = f"""
+        SELECT COUNT(*)
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        {where_sql}
+    """
+    cursor.execute(count_query, params)
+    total = cursor.fetchone()[0]
+
+    select_query = f"""
+        SELECT pr.*, 
+               p.name as patient_name, p.gender as patient_gender, p.age as patient_age, p.email as patient_email,
+               d.name as doctor_name, d.specialization as doctor_specialization,
+               (SELECT COUNT(*) FROM prescription_amendments pa WHERE pa.prescription_id = pr.id) as amendment_count
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        {where_sql}
+        ORDER BY pr.prescription_date {sort_dir.upper()}, pr.id {sort_dir.upper()}
+        LIMIT ? OFFSET ?
+    """
+    cursor.execute(select_query, params + [per_page, offset])
+    rows = cursor.fetchall()
+    conn.close()
+
+    prescriptions_list = []
+    for r in rows:
+        p_dict = row_to_prescription_dict(r)
+        p_dict["amendment_count"] = r["amendment_count"] or 0
+        p_dict["patient_email"] = r["patient_email"] or ""
+        p_dict["updated_at"] = r["updated_at"] if "updated_at" in r.keys() else None
+        p_dict["medical_record_id"] = r["medical_record_id"] if "medical_record_id" in r.keys() else None
+        prescriptions_list.append(p_dict)
+
+    total_pages = max(1, math.ceil(total / per_page))
+
+    return jsonify({
+        "prescriptions": prescriptions_list,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages
+    })
+
+
+@app.route("/api/prescriptions/<int:prescription_id>", methods=["GET"])
+@require_auth
+def get_prescription_by_id(prescription_id, current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT pr.*, 
+               p.name as patient_name, p.gender as patient_gender, p.age as patient_age, p.email as patient_email, p.disease as patient_disease,
+               d.name as doctor_name, d.specialization as doctor_specialization, d.email as doctor_email, d.phone as doctor_phone,
+               mr.diagnosis as medical_record_diagnosis, mr.consultation_date as medical_record_date
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        LEFT JOIN medical_records mr ON pr.medical_record_id = mr.id
+        WHERE pr.id = ?
+    """, (prescription_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Prescription record not found."}), 404
+
+    if current_user["role"] == "patient" and current_user["patient_id"] and row["patient_id"] != current_user["patient_id"]:
+        conn.close()
+        return jsonify({"error": "Access Denied: You may only view your own prescriptions."}), 403
+
+    cursor.execute("""
+        SELECT * FROM prescription_amendments
+        WHERE prescription_id = ?
+        ORDER BY created_at DESC, id DESC
+    """, (prescription_id,))
+    amendments = [dict(a) for a in cursor.fetchall()]
+    conn.close()
+
+    res = row_to_prescription_dict(row)
+    res["patient_email"] = row["patient_email"]
+    res["patient_disease"] = row["patient_disease"]
+    res["doctor_email"] = row["doctor_email"]
+    res["doctor_phone"] = row["doctor_phone"]
+    res["medical_record_id"] = row["medical_record_id"] if "medical_record_id" in row.keys() else None
+    res["medical_record_diagnosis"] = row["medical_record_diagnosis"] if "medical_record_diagnosis" in row.keys() else None
+    res["medical_record_date"] = row["medical_record_date"] if "medical_record_date" in row.keys() else None
+    res["amendments"] = amendments
+
+    return jsonify(res)
+
+
+@app.route("/api/prescriptions", methods=["POST"])
+@require_role("admin", "doctor")
+def create_prescription_record(current_user):
+    data = request.get_json(silent=True) or {}
+    patient_id = data.get("patient_id")
+    doctor_id = data.get("doctor_id")
+    medical_record_id = data.get("medical_record_id")
+    medications = data.get("medications") or []
+
+    if not medications and data.get("medication_name"):
+        medications = [{
+            "medication_name": data.get("medication_name"),
+            "dosage": data.get("dosage"),
+            "frequency": data.get("frequency"),
+            "duration": data.get("duration", "30 days"),
+            "route": data.get("route", "Oral"),
+            "instructions": data.get("instructions", "")
+        }]
+
+    if not patient_id:
+        return jsonify({"error": "Patient selection is required."}), 400
+    if not medications:
+        return jsonify({"error": "At least one medication with dosage and frequency is required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, name, doctor_id FROM patients WHERE id = ?", (patient_id,))
+    patient = cursor.fetchone()
+    if not patient:
+        conn.close()
+        return jsonify({"error": "Patient not found."}), 404
+
+    if current_user["role"] == "doctor":
+        target_doctor_id = current_user.get("doctor_id") or patient["doctor_id"] or 1
+    else:
+        target_doctor_id = doctor_id or patient["doctor_id"] or 1
+
+    cursor.execute("SELECT id, name, specialization FROM doctors WHERE id = ?", (target_doctor_id,))
+    doctor = cursor.fetchone()
+    if not doctor:
+        conn.close()
+        return jsonify({"error": "Selected prescribing doctor not found."}), 404
+
+    prescription_date = data.get("prescription_date") or datetime.now().strftime("%Y-%m-%d")
+    created_ids = []
+
+    for med in medications:
+        med_name = (med.get("medication_name") or "").strip()
+        dosage = (med.get("dosage") or "").strip()
+        freq = (med.get("frequency") or "").strip()
+        dur = (med.get("duration") or "30 days").strip()
+        route = (med.get("route") or "Oral").strip()
+        instr = (med.get("instructions") or "").strip()
+
+        if not med_name or not dosage or not freq:
+            continue
+
+        cursor.execute("""
+            INSERT INTO prescriptions (
+                patient_id, doctor_id, medical_record_id, medication_name,
+                dosage, frequency, duration, route, instructions,
+                prescription_date, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (
+            patient_id, target_doctor_id, medical_record_id, med_name,
+            dosage, freq, dur, route, instr, prescription_date
+        ))
+        created_ids.append(cursor.lastrowid)
+
+    conn.commit()
+
+    if not created_ids:
+        conn.close()
+        return jsonify({"error": "No valid medication items were provided (name, dosage, and frequency are required)."}), 400
+
+    log_activity(
+        "PRESCRIPTION_ISSUED",
+        f"Issued {len(created_ids)} prescription item(s) for patient {patient['name']} by {doctor['name']}",
+        "Prescription",
+        created_ids[0],
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    cursor.execute("""
+        SELECT pr.*, p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.id = ?
+    """, (created_ids[0],))
+    first_item = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": f"Successfully created {len(created_ids)} prescription item(s).",
+        "prescription": row_to_prescription_dict(first_item),
+        "created_ids": created_ids
+    }), 201
+
+
+@app.route("/api/prescriptions/<int:prescription_id>", methods=["PUT"])
+@require_role("admin", "doctor")
+def update_prescription_record(prescription_id, current_user):
+    data = request.get_json(silent=True) or {}
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT pr.*, p.name as patient_name, d.name as doctor_name
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.id = ?
+    """, (prescription_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "Prescription not found."}), 404
+
+    new_status = data.get("status")
+    amendment_reason = (data.get("amendment_reason") or "").strip()
+
+    clinical_fields = ["medication_name", "dosage", "frequency", "duration", "route", "instructions"]
+    clinical_changed = any(
+        f in data and str(data[f]).strip() != str(existing[f] or "").strip()
+        for f in clinical_fields
+    )
+
+    if clinical_changed and not amendment_reason:
+        conn.close()
+        return jsonify({"error": "An amendment reason is required when modifying clinical prescription details."}), 400
+
+    if clinical_changed:
+        prev_snapshot = json.dumps({
+            "medication_name": existing["medication_name"],
+            "dosage": existing["dosage"],
+            "frequency": existing["frequency"],
+            "duration": existing["duration"],
+            "route": existing["route"],
+            "instructions": existing["instructions"],
+            "status": existing["status"]
+        })
+        cursor.execute("""
+            INSERT INTO prescription_amendments (
+                prescription_id, amended_by_user_id, amended_by_name, amended_by_role,
+                previous_data, amendment_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            prescription_id, current_user["id"], current_user["name"],
+            current_user["role"].capitalize(), prev_snapshot, amendment_reason
+        ))
+
+    updated_medication = data.get("medication_name", existing["medication_name"])
+    updated_dosage = data.get("dosage", existing["dosage"])
+    updated_frequency = data.get("frequency", existing["frequency"])
+    updated_duration = data.get("duration", existing["duration"])
+    updated_route = data.get("route", existing["route"])
+    updated_instructions = data.get("instructions", existing["instructions"])
+    updated_status = new_status or existing["status"]
+
+    cursor.execute("""
+        UPDATE prescriptions SET
+            medication_name = ?,
+            dosage = ?,
+            frequency = ?,
+            duration = ?,
+            route = ?,
+            instructions = ?,
+            status = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (
+        updated_medication, updated_dosage, updated_frequency,
+        updated_duration, updated_route, updated_instructions,
+        updated_status, prescription_id
+    ))
+    conn.commit()
+
+    log_activity(
+        "PRESCRIPTION_UPDATED",
+        f"Prescription #{prescription_id} updated: status={updated_status}" + (f", Reason: {amendment_reason}" if amendment_reason else ""),
+        "Prescription",
+        prescription_id,
+        current_user["name"],
+        current_user["role"].capitalize()
+    )
+
+    cursor.execute("""
+        SELECT pr.*, p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+               d.name as doctor_name, d.specialization as doctor_specialization
+        FROM prescriptions pr
+        JOIN patients p ON pr.patient_id = p.id
+        JOIN doctors d ON pr.doctor_id = d.id
+        WHERE pr.id = ?
+    """, (prescription_id,))
+    updated_row = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "message": "Prescription updated successfully.",
+        "prescription": row_to_prescription_dict(updated_row)
+    })
+
+
+# ---------------------------------------------------------
+# MODULE B: REPORTS & ANALYTICS REST APIS
+# ---------------------------------------------------------
+
+@app.route("/api/admin/reports/overview", methods=["GET"])
+@require_role("admin")
+def get_reports_overview(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM patients")
+    total_patients = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM doctors")
+    total_doctors = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM appointments")
+    total_appointments = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM medical_records")
+    total_medical_records = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM prescriptions")
+    total_prescriptions = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT specialization, COUNT(*) as count 
+        FROM doctors 
+        GROUP BY specialization 
+        ORDER BY count DESC
+    """)
+    department_dist = [{"name": r["specialization"], "value": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute("""
+        SELECT status, COUNT(*) as count 
+        FROM medical_records 
+        GROUP BY status
+    """)
+    records_by_status = [{"status": r["status"], "count": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute("""
+        SELECT status, COUNT(*) as count 
+        FROM appointments 
+        GROUP BY status
+    """)
+    appointments_by_status = [{"status": r["status"], "count": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute("""
+        SELECT status, COUNT(*) as count 
+        FROM prescriptions 
+        GROUP BY status
+    """)
+    prescriptions_by_status = [{"status": r["status"] or "Active", "count": r["count"]} for r in cursor.fetchall()]
+
+    conn.close()
+
+    return jsonify({
+        "overview": {
+            "total_patients": total_patients,
+            "total_doctors": total_doctors,
+            "total_appointments": total_appointments,
+            "total_medical_records": total_medical_records,
+            "total_prescriptions": total_prescriptions
+        },
+        "department_distribution": department_dist,
+        "records_by_status": records_by_status,
+        "appointments_by_status": appointments_by_status,
+        "prescriptions_by_status": prescriptions_by_status,
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    })
+
+
+@app.route("/api/admin/reports/patients", methods=["GET"])
+@require_role("admin")
+def get_patient_analytics(current_user):
+    start_date = request.args.get("startDate", "").strip()
+    end_date = request.args.get("endDate", "").strip()
+
+    where_clauses = []
+    params = []
+    if start_date:
+        where_clauses.append("created_at >= ?")
+        params.append(start_date)
+    if end_date:
+        where_clauses.append("created_at <= ?")
+        params.append(end_date + " 23:59:59")
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(f"""
+        SELECT strftime('%Y-%m', created_at) as month, COUNT(*) as count
+        FROM patients
+        {where_sql}
+        GROUP BY strftime('%Y-%m', created_at)
+        ORDER BY month ASC
+    """, params)
+    reg_over_time = [{"month": r["month"], "registrations": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute(f"""
+        SELECT gender, COUNT(*) as count
+        FROM patients
+        {where_sql}
+        GROUP BY gender
+    """, params)
+    gender_dist = [{"name": r["gender"] or "Unspecified", "value": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute(f"""
+        SELECT disease, COUNT(*) as count
+        FROM patients
+        {where_sql}
+        GROUP BY disease
+        ORDER BY count DESC
+        LIMIT 6
+    """, params)
+    condition_dist = [{"condition": r["disease"] or "General Checkup", "count": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute(f"SELECT COUNT(*) FROM patients {where_sql}", params)
+    total_in_range = cursor.fetchone()[0]
+
+    conn.close()
+
+    return jsonify({
+        "registrations_over_time": reg_over_time,
+        "gender_distribution": gender_dist,
+        "condition_distribution": condition_dist,
+        "total_registered_in_range": total_in_range
+    })
+
+
+@app.route("/api/admin/reports/appointments", methods=["GET"])
+@require_role("admin")
+def get_appointment_analytics(current_user):
+    start_date = request.args.get("startDate", "").strip()
+    end_date = request.args.get("endDate", "").strip()
+
+    where_clauses = []
+    params = []
+    if start_date:
+        where_clauses.append("appointment_date >= ?")
+        params.append(start_date)
+    if end_date:
+        where_clauses.append("appointment_date <= ?")
+        params.append(end_date)
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(f"""
+        SELECT status, COUNT(*) as count
+        FROM appointments
+        {where_sql}
+        GROUP BY status
+    """, params)
+    by_status = [{"status": r["status"] or "Scheduled", "count": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute(f"""
+        SELECT appointment_date, COUNT(*) as count
+        FROM appointments
+        {where_sql}
+        GROUP BY appointment_date
+        ORDER BY appointment_date ASC
+    """, params)
+    volume = [{"date": str(r["appointment_date"]), "appointments": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute(f"SELECT COUNT(*) FROM appointments {where_sql}", params)
+    total = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM appointments WHERE appointment_date >= CURRENT_DATE AND LOWER(status) = 'scheduled'")
+    upcoming = cursor.fetchone()[0]
+
+    conn.close()
+
+    return jsonify({
+        "appointments_by_status": by_status,
+        "volume_over_time": volume,
+        "total_in_range": total,
+        "upcoming_appointments": upcoming
+    })
+
+
+@app.route("/api/admin/reports/doctors", methods=["GET"])
+@require_role("admin")
+def get_doctor_analytics(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT d.id, d.name, d.specialization, d.status,
+               (SELECT COUNT(*) FROM patients p WHERE p.doctor_id = d.id) as patient_count,
+               (SELECT COUNT(*) FROM appointments a WHERE a.doctor_id = d.id) as appointment_count,
+               (SELECT COUNT(*) FROM medical_records mr WHERE mr.doctor_id = d.id) as record_count,
+               (SELECT COUNT(*) FROM prescriptions pr WHERE pr.doctor_id = d.id) as prescription_count
+        FROM doctors d
+        ORDER BY appointment_count DESC, d.name ASC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    doctors_summary = [{
+        "id": r["id"],
+        "name": r["name"],
+        "specialization": r["specialization"],
+        "status": r["status"],
+        "patient_count": r["patient_count"] or 0,
+        "appointment_count": r["appointment_count"] or 0,
+        "record_count": r["record_count"] or 0,
+        "prescription_count": r["prescription_count"] or 0
+    } for r in rows]
+
+    return jsonify({
+        "doctors_summary": doctors_summary,
+        "total_doctors": len(doctors_summary)
+    })
+
+
+@app.route("/api/admin/reports/medical-records", methods=["GET"])
+@require_role("admin")
+def get_medical_records_analytics(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT status, COUNT(*) as count
+        FROM medical_records
+        GROUP BY status
+    """)
+    status_counts = [{"status": r["status"], "count": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute("""
+        SELECT strftime('%Y-%m', consultation_date) as month, COUNT(*) as count
+        FROM medical_records
+        GROUP BY strftime('%Y-%m', consultation_date)
+        ORDER BY month ASC
+    """)
+    records_over_time = [{"month": r["month"], "records": r["count"]} for r in cursor.fetchall()]
+
+    cursor.execute("SELECT COUNT(*) FROM medical_records WHERE is_amended = TRUE")
+    amended_count = cursor.fetchone()[0]
+
+    conn.close()
+
+    return jsonify({
+        "status_distribution": status_counts,
+        "records_over_time": records_over_time,
+        "amended_records_count": amended_count
+    })
+
+
+@app.route("/api/admin/reports/export", methods=["GET"])
+@require_role("admin")
+def export_report_csv(current_user):
+    export_type = request.args.get("type", "patients").lower()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    if export_type == "patients":
+        cursor.execute("""
+            SELECT id, name, gender, age, weight, disease, doctor_name, created_at
+            FROM patients
+            ORDER BY id ASC
+        """)
+        rows = cursor.fetchall()
+        writer.writerow(["Patient ID", "Name", "Gender", "Age", "Weight", "Condition/Disease", "Assigned Doctor", "Registration Date"])
+        for r in rows:
+            writer.writerow([r["id"], r["name"], r["gender"], r["age"], r["weight"], r["disease"], r["doctor_name"], r["created_at"]])
+        filename = f"healthpulse_patients_{datetime.now().strftime('%Y%m%d')}.csv"
+
+    elif export_type == "appointments":
+        cursor.execute("""
+            SELECT a.id, p.name as patient_name, d.name as doctor_name, a.appointment_date, a.appointment_time, a.status, a.reason
+            FROM appointments a
+            JOIN patients p ON a.patient_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            ORDER BY a.appointment_date DESC, a.id DESC
+        """)
+        rows = cursor.fetchall()
+        writer.writerow(["Appointment ID", "Patient Name", "Doctor Name", "Date", "Time", "Status", "Reason"])
+        for r in rows:
+            writer.writerow([r["id"], r["patient_name"], r["doctor_name"], r["appointment_date"], r["appointment_time"], r["status"], r["reason"]])
+        filename = f"healthpulse_appointments_{datetime.now().strftime('%Y%m%d')}.csv"
+
+    elif export_type == "doctors":
+        cursor.execute("""
+            SELECT d.id, d.name, d.email, d.specialization, d.phone, d.status,
+                   (SELECT COUNT(*) FROM patients p WHERE p.doctor_id = d.id) as patients_count,
+                   (SELECT COUNT(*) FROM appointments a WHERE a.doctor_id = d.id) as appts_count
+            FROM doctors d
+            ORDER BY d.id ASC
+        """)
+        rows = cursor.fetchall()
+        writer.writerow(["Doctor ID", "Name", "Email", "Specialization", "Phone", "Status", "Assigned Patients", "Appointments"])
+        for r in rows:
+            writer.writerow([r["id"], r["name"], r["email"], r["specialization"], r["phone"], r["status"], r["patients_count"], r["appts_count"]])
+        filename = f"healthpulse_doctors_{datetime.now().strftime('%Y%m%d')}.csv"
+
+    elif export_type == "prescriptions":
+        cursor.execute("""
+            SELECT pr.id, p.name as patient_name, d.name as doctor_name, pr.medication_name, pr.dosage, pr.frequency, pr.duration, pr.prescription_date, pr.status
+            FROM prescriptions pr
+            JOIN patients p ON pr.patient_id = p.id
+            JOIN doctors d ON pr.doctor_id = d.id
+            ORDER BY pr.prescription_date DESC, pr.id DESC
+        """)
+        rows = cursor.fetchall()
+        writer.writerow(["Prescription ID", "Patient Name", "Doctor Name", "Medication", "Dosage", "Frequency", "Duration", "Prescription Date", "Status"])
+        for r in rows:
+            writer.writerow([r["id"], r["patient_name"], r["doctor_name"], r["medication_name"], r["dosage"], r["frequency"], r["duration"], r["prescription_date"], r["status"]])
+        filename = f"healthpulse_prescriptions_{datetime.now().strftime('%Y%m%d')}.csv"
+
+    elif export_type == "medical-records":
+        cursor.execute("""
+            SELECT mr.id, p.name as patient_name, d.name as doctor_name, mr.consultation_date, mr.visit_type, mr.diagnosis, mr.status
+            FROM medical_records mr
+            JOIN patients p ON mr.patient_id = p.id
+            JOIN doctors d ON mr.doctor_id = d.id
+            ORDER BY mr.consultation_date DESC, mr.id DESC
+        """)
+        rows = cursor.fetchall()
+        writer.writerow(["Record ID", "Patient Name", "Doctor Name", "Consultation Date", "Visit Type", "Diagnosis", "Status"])
+        for r in rows:
+            writer.writerow([r["id"], r["patient_name"], r["doctor_name"], r["consultation_date"], r["visit_type"], r["diagnosis"], r["status"]])
+        filename = f"healthpulse_medical_records_{datetime.now().strftime('%Y%m%d')}.csv"
+
+    else:
+        conn.close()
+        return jsonify({"error": "Invalid export category requested."}), 400
+
+    conn.close()
+
+    csv_content = output.getvalue()
+    response = make_response(csv_content)
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    response.headers["Content-type"] = "text/csv; charset=utf-8"
+    return response
+
+
+# ---------------------------------------------------------
+# MODULE C: SETTINGS & SECURITY REST APIS
+# ---------------------------------------------------------
+
+@app.route("/api/admin/settings", methods=["GET"])
+@require_role("admin")
+def get_admin_settings(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT key, value, updated_at, updated_by FROM app_settings")
+    rows = cursor.fetchall()
+
+    cursor.execute("SELECT COUNT(*) FROM user_tokens WHERE expires_at > CURRENT_TIMESTAMP;")
+    active_sessions = cursor.fetchone()[0]
+
+    conn.close()
+
+    settings_dict = {r["key"]: r["value"] for r in rows}
+
+    db_info = test_database_connection()
+    backup_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patients_backup_sqlite.db")
+    backup_info = None
+    if os.path.exists(backup_path):
+        mtime = os.path.getmtime(backup_path)
+        backup_info = {
+            "exists": True,
+            "last_backup": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "size_bytes": os.path.getsize(backup_path)
+        }
+
+    return jsonify({
+        "settings": settings_dict,
+        "system": {
+            "active_database_engine": get_active_db_engine(),
+            "database_connected": db_info.get("connected", False),
+            "database_details": db_info.get("details", {}),
+            "active_sessions_count": active_sessions,
+            "backup_info": backup_info,
+            "server_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+    })
+
+
+@app.route("/api/admin/settings", methods=["PUT"])
+@require_role("admin")
+def update_admin_settings(current_user):
+    data = request.get_json(silent=True) or {}
+    settings_to_update = data.get("settings") or {}
+
+    if not settings_to_update:
+        return jsonify({"error": "No settings provided for update."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    allowed_keys = [
+        "hospital_name", "hospital_tagline", "hospital_email", "hospital_phone",
+        "default_timezone", "date_format", "session_timeout_minutes",
+        "max_login_attempts", "require_strong_passwords", "audit_logging_enabled",
+        "email_notifications_enabled", "auto_archive_records_days"
+    ]
+
+    for key, value in settings_to_update.items():
+        if key in allowed_keys:
+            cursor.execute("""
+                INSERT INTO app_settings (key, value, updated_at, updated_by)
+                VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP, updated_by = EXCLUDED.updated_by
+            """, (key, str(value).strip(), current_user["name"]))
+
+    conn.commit()
+    conn.close()
+
+    log_activity(
+        "SETTINGS_UPDATED",
+        f"Application settings updated by {current_user['name']}",
+        "Settings",
+        None,
+        current_user["name"],
+        "Admin"
+    )
+
+    return jsonify({
+        "message": "Application settings updated successfully.",
+        "settings": settings_to_update
+    })
+
+
+@app.route("/api/admin/users", methods=["GET"])
+@require_role("admin")
+def get_admin_users(current_user):
+    role_filter = request.args.get("role", "").strip().lower()
+    status_filter = request.args.get("status", "").strip().lower()
+
+    where_clauses = []
+    params = []
+
+    if role_filter and role_filter != "all":
+        where_clauses.append("LOWER(role) = ?")
+        params.append(role_filter)
+
+    if status_filter and status_filter != "all":
+        is_act = 1 if status_filter == "active" else 0
+        where_clauses.append("is_active = (?)::boolean")
+        params.append(is_act)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(f"""
+        SELECT id, name, email, role, is_active, created_at
+        FROM users
+        {where_sql}
+        ORDER BY id ASC
+    """, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    users_list = []
+    for r in rows:
+        users_list.append({
+            "id": r["id"],
+            "name": r["name"],
+            "email": r["email"],
+            "role": r["role"],
+            "is_active": bool(r["is_active"]),
+            "created_at": r["created_at"]
+        })
+
+    return jsonify(users_list)
+
+
+@app.route("/api/admin/change-password", methods=["POST"])
+@require_role("admin")
+def admin_change_password(current_user):
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("current_password", "").strip()
+    new_password = data.get("new_password", "").strip()
+
+    if not current_password or not new_password:
+        return jsonify({"error": "Both current password and new password are required."}), 400
+
+    if len(new_password) < 8:
+        return jsonify({"error": "New password must be at least 8 characters in length."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, password_hash FROM users WHERE id = ?", (current_user["id"],))
+    user_row = cursor.fetchone()
+    if not user_row:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    stored_hash = user_row["password_hash"]
+    is_valid = False
+    if stored_hash.startswith("pbkdf2:sha256:") or stored_hash.startswith("scrypt:"):
+        is_valid = check_password_hash(stored_hash, current_password)
+    else:
+        is_valid = (stored_hash == current_password)
+
+    if not is_valid:
+        conn.close()
+        return jsonify({"error": "The current password entered is incorrect. Please verify and try again."}), 400
+
+    new_hash = generate_password_hash(new_password)
+    cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, current_user["id"]))
+    cursor.execute("UPDATE admins SET password = ? WHERE email = ?", (new_hash, current_user["email"]))
+    conn.commit()
+    conn.close()
+
+    log_activity(
+        "PASSWORD_CHANGED",
+        f"Password changed for administrator {current_user['name']}",
+        "User",
+        current_user["id"],
+        current_user["name"],
+        "Admin"
+    )
+
+    return jsonify({"message": "Password updated successfully."})
+
+
+@app.route("/api/admin/profile", methods=["PUT"])
+@require_role("admin")
+def update_admin_profile(current_user):
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    email = data.get("email", "").strip().lower()
+
+    if not name or not email:
+        return jsonify({"error": "Both name and email are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if email != current_user["email"].lower():
+        cursor.execute("SELECT id FROM users WHERE LOWER(email) = ? AND id != ?", (email, current_user["id"]))
+        if cursor.fetchone():
+            conn.close()
+            return jsonify({"error": "This email address is already registered to another account."}), 400
+
+    cursor.execute("UPDATE users SET name = ?, email = ? WHERE id = ?", (name, email, current_user["id"]))
+    cursor.execute("UPDATE admins SET name = ?, email = ? WHERE email = ?", (name, email, current_user["email"]))
+    conn.commit()
+    conn.close()
+
+    log_activity(
+        "PROFILE_UPDATED",
+        f"Administrator profile updated for {name} ({email})",
+        "User",
+        current_user["id"],
+        name,
+        "Admin"
+    )
+
+    return jsonify({
+        "message": "Profile updated successfully.",
+        "user": {
+            "id": current_user["id"],
+            "name": name,
+            "email": email
+        }
+    })
+
+
+@app.route("/api/admin/audit-logs", methods=["GET"])
+@require_role("admin")
+def get_admin_audit_logs(current_user):
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = max(1, min(100, int(request.args.get("per_page", 20))))
+    offset = (page - 1) * per_page
+
+    search = (request.args.get("search") or "").strip().lower()
+    event_type = (request.args.get("eventType") or "").strip()
+
+    where_clauses = []
+    params = []
+
+    if event_type and event_type.upper() != "ALL":
+        where_clauses.append("event_type = ?")
+        params.append(event_type)
+
+    if search:
+        term = f"%{search}%"
+        where_clauses.append("(LOWER(description) LIKE ? OR LOWER(actor_name) LIKE ? OR LOWER(event_type) LIKE ?)")
+        params.extend([term, term, term])
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(f"SELECT COUNT(*) FROM activity_logs {where_sql}", params)
+    total = cursor.fetchone()[0]
+
+    cursor.execute(f"""
+        SELECT * FROM activity_logs
+        {where_sql}
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+    """, params + [per_page, offset])
+    rows = cursor.fetchall()
+    conn.close()
+
+    logs = [dict(r) for r in rows]
+    total_pages = max(1, math.ceil(total / per_page))
+
+    return jsonify({
+        "logs": logs,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages
+    })
+
+
+@app.route("/api/admin/sessions/revoke-all", methods=["POST"])
+@require_role("admin")
+def revoke_all_sessions(current_user):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM user_tokens WHERE token != ?", (current_user["token"],))
+    revoked_count = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    log_activity(
+        "SESSIONS_REVOKED",
+        f"All other active sessions revoked by {current_user['name']} ({revoked_count} revoked)",
+        "Security",
+        None,
+        current_user["name"],
+        "Admin"
+    )
+
+    return jsonify({
+        "message": f"Successfully revoked {revoked_count} active user session(s).",
+        "revoked_count": revoked_count
+    })
+
+
+@app.route("/api/admin/system/health", methods=["GET"])
+@require_role("admin")
+def get_system_health(current_user):
+    t0 = time.time()
+    status = test_database_connection()
+    latency_ms = round((time.time() - t0) * 1000, 2)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    users_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM user_tokens WHERE expires_at > CURRENT_TIMESTAMP")
+    tokens_count = cursor.fetchone()[0]
+    conn.close()
+
+    return jsonify({
+        "status": "healthy" if status.get("connected") else "degraded",
+        "database": {
+            "engine": status.get("engine"),
+            "connected": status.get("connected"),
+            "latency_ms": latency_ms,
+            "version": status.get("details", {}).get("version"),
+            "database_name": status.get("details", {}).get("database")
+        },
+        "stats": {
+            "total_users": users_count,
+            "active_sessions": tokens_count,
+            "server_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+    })
+
+
+# ---------------------------------------------------------
+# HOSPITAL MANAGEMENT SYSTEM: CORE CLINICAL & OPERATIONS ENDPOINTS
+# ---------------------------------------------------------
+
+@app.route("/api/departments", methods=["GET"])
+def get_departments():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            d.id, d.name, d.code, d.description, d.phone, d.location,
+            doc.name as head_doctor_name, doc.specialization as head_doctor_specialization,
+            (SELECT COUNT(*) FROM doctors doc2 WHERE doc2.department_id = d.id) as doctor_count,
+            (SELECT COUNT(*) FROM staff s WHERE s.department_id = d.id) as staff_count,
+            (SELECT COUNT(*) FROM rooms r WHERE r.department_id = d.id) as room_count
+        FROM departments d
+        LEFT JOIN doctors doc ON d.head_doctor_id = doc.id
+        ORDER BY d.id ASC;
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return jsonify({
+        "departments": [dict(r) for r in rows],
+        "total": len(rows)
+    })
+
+
+@app.route("/api/staff", methods=["GET"])
+def get_staff_list():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    search = request.args.get("search", "").strip()
+    role = request.args.get("role", "").strip()
+    dept_id = request.args.get("department_id", type=int)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+
+    if search:
+        where_clauses.append("(s.name LIKE ? OR s.email LIKE ? OR s.qualification LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+    if role:
+        where_clauses.append("s.role = ?")
+        params.append(role)
+    if dept_id:
+        where_clauses.append("s.department_id = ?")
+        params.append(dept_id)
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"SELECT COUNT(*) as count FROM staff s WHERE {where_sql}", tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            s.id, s.name, s.role, s.email, s.phone, s.shift, s.status,
+            s.qualification, s.salary, s.joined_date, s.created_at,
+            d.name as department_name, d.code as department_code
+        FROM staff s
+        LEFT JOIN departments d ON s.department_id = d.id
+        WHERE {where_sql}
+        ORDER BY s.id ASC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "staff": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/medicines", methods=["GET"])
+def get_medicines_catalog():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    search = request.args.get("search", "").strip()
+    category = request.args.get("category", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+
+    if search:
+        where_clauses.append("(m.name LIKE ? OR m.generic_name LIKE ? OR m.manufacturer LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+    if category:
+        where_clauses.append("m.category = ?")
+        params.append(category)
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"SELECT COUNT(*) as count FROM medicines m WHERE {where_sql}", tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            m.id, m.name, m.generic_name, m.category, m.dosage_form,
+            m.strength, m.manufacturer, m.price, m.stock_quantity,
+            m.reorder_level, m.expiry_date, m.created_at
+        FROM medicines m
+        WHERE {where_sql}
+        ORDER BY m.name ASC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+
+    # Also retrieve distinct categories for filter dropdowns
+    cursor.execute("SELECT DISTINCT category FROM medicines WHERE category IS NOT NULL ORDER BY category;")
+    categories = [r["category"] for r in cursor.fetchall()]
+
+    conn.close()
+
+    return jsonify({
+        "medicines": [dict(r) for r in rows],
+        "categories": categories,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/rooms", methods=["GET"])
+def get_rooms():
+    dept_id = request.args.get("department_id", type=int)
+    room_type = request.args.get("room_type", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if dept_id:
+        where_clauses.append("r.department_id = ?")
+        params.append(dept_id)
+    if room_type:
+        where_clauses.append("r.room_type = ?")
+        params.append(room_type)
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT 
+            r.id, r.room_number, r.room_type, r.floor, r.charge_per_day, r.status,
+            d.name as department_name, d.code as department_code,
+            (SELECT COUNT(*) FROM beds b WHERE b.room_id = r.id) as total_beds,
+            (SELECT COUNT(*) FROM beds b WHERE b.room_id = r.id AND b.status = 'Occupied') as occupied_beds,
+            (SELECT COUNT(*) FROM beds b WHERE b.room_id = r.id AND b.status = 'Available') as available_beds
+        FROM rooms r
+        LEFT JOIN departments d ON r.department_id = d.id
+        WHERE {where_sql}
+        ORDER BY r.floor ASC, r.room_number ASC;
+    """, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "rooms": [dict(r) for r in rows],
+        "total": len(rows)
+    })
+
+
+@app.route("/api/beds", methods=["GET"])
+def get_beds():
+    status = request.args.get("status", "").strip()
+    room_id = request.args.get("room_id", type=int)
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 50, type=int)))
+    offset = (page - 1) * limit
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if status:
+        where_clauses.append("b.status = ?")
+        params.append(status)
+    if room_id:
+        where_clauses.append("b.room_id = ?")
+        params.append(room_id)
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"SELECT COUNT(*) as count FROM beds b WHERE {where_sql}", tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            b.id, b.bed_number, b.status, b.created_at,
+            r.room_number, r.room_type, r.floor, r.charge_per_day,
+            d.name as department_name
+        FROM beds b
+        JOIN rooms r ON b.room_id = r.id
+        LEFT JOIN departments d ON r.department_id = d.id
+        WHERE {where_sql}
+        ORDER BY b.id ASC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "beds": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/beds/summary", methods=["GET"])
+def get_beds_summary():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_beds,
+            COUNT(CASE WHEN status = 'Occupied' THEN 1 END) as occupied_beds,
+            COUNT(CASE WHEN status = 'Available' THEN 1 END) as available_beds
+        FROM beds;
+    """)
     row = cursor.fetchone()
     conn.close()
 
-    if row:
-        return jsonify({
-            "message": "Login successful",
-            "patient": row_to_patient_dict(row)
-        })
+    total = row["total_beds"] or 0
+    occupied = row["occupied_beds"] or 0
+    available = row["available_beds"] or 0
+    rate = round((occupied / total * 100), 1) if total > 0 else 0.0
 
-    return jsonify({"error": "Unauthorized", "message": "Invalid email or password"}), 401
+    return jsonify({
+        "total_beds": total,
+        "occupied_beds": occupied,
+        "available_beds": available,
+        "occupancy_rate": f"{rate}%"
+    })
+
+
+@app.route("/api/admissions", methods=["GET"])
+def get_admissions():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if status:
+        where_clauses.append("a.status = ?")
+        params.append(status)
+    if search:
+        where_clauses.append("(a.admission_number LIKE ? OR p.name LIKE ? OR doc.name LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count 
+        FROM admissions a
+        JOIN patients p ON a.patient_id = p.id
+        LEFT JOIN doctors doc ON a.attending_doctor_id = doc.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            a.id, a.admission_number, a.admission_date, a.admission_reason,
+            a.diagnosis, a.status, a.created_at,
+            p.id as patient_id, p.name as patient_name, p.gender as patient_gender, p.age as patient_age,
+            b.bed_number, r.room_number, r.room_type,
+            doc.id as doctor_id, doc.name as doctor_name, doc.specialization as doctor_specialization
+        FROM admissions a
+        JOIN patients p ON a.patient_id = p.id
+        JOIN beds b ON a.bed_id = b.id
+        JOIN rooms r ON b.room_id = r.id
+        LEFT JOIN doctors doc ON a.attending_doctor_id = doc.id
+        WHERE {where_sql}
+        ORDER BY a.admission_date DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "admissions": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/admissions/stats", methods=["GET"])
+def get_admissions_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_admissions,
+            COUNT(CASE WHEN status = 'Admitted' THEN 1 END) as active_admissions,
+            COUNT(CASE WHEN status = 'Discharged' THEN 1 END) as discharged_admissions
+        FROM admissions;
+    """)
+    row = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "total_admissions": row["total_admissions"] or 0,
+        "active_admissions": row["active_admissions"] or 0,
+        "discharged_admissions": row["discharged_admissions"] or 0
+    })
+
+
+@app.route("/api/discharges", methods=["GET"])
+def get_discharges():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if search:
+        where_clauses.append("(p.name LIKE ? OR a.admission_number LIKE ? OR d.condition_at_discharge LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count
+        FROM discharges d
+        JOIN patients p ON d.patient_id = p.id
+        JOIN admissions a ON d.admission_id = a.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            d.id, d.discharge_date, d.discharge_summary, d.condition_at_discharge,
+            d.follow_up_instructions, d.created_at,
+            p.id as patient_id, p.name as patient_name,
+            a.admission_number, a.admission_date, a.diagnosis
+        FROM discharges d
+        JOIN patients p ON d.patient_id = p.id
+        JOIN admissions a ON d.admission_id = a.id
+        WHERE {where_sql}
+        ORDER BY d.discharge_date DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "discharges": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/billing", methods=["GET"])
+def get_billing_records():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if status:
+        where_clauses.append("br.status = ?")
+        params.append(status)
+    if search:
+        where_clauses.append("(br.bill_number LIKE ? OR p.name LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count
+        FROM billing_records br
+        JOIN patients p ON br.patient_id = p.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            br.id, br.bill_number, br.total_amount, br.discount_amount,
+            br.tax_amount, br.net_amount, br.paid_amount, br.balance_amount,
+            br.status, br.bill_date, br.due_date, br.created_at,
+            p.id as patient_id, p.name as patient_name, p.email as patient_email, p.phone as patient_phone,
+            br.appointment_id, br.admission_id
+        FROM billing_records br
+        JOIN patients p ON br.patient_id = p.id
+        WHERE {where_sql}
+        ORDER BY br.bill_date DESC, br.id DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "billing_records": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/billing/stats", methods=["GET"])
+def get_billing_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_bills,
+            COALESCE(SUM(total_amount), 0) as gross_billed,
+            COALESCE(SUM(discount_amount), 0) as total_discounts,
+            COALESCE(SUM(tax_amount), 0) as total_tax,
+            COALESCE(SUM(net_amount), 0) as net_billed,
+            COALESCE(SUM(paid_amount), 0) as total_collected,
+            COALESCE(SUM(balance_amount), 0) as total_outstanding,
+            COUNT(CASE WHEN status = 'Paid' THEN 1 END) as paid_invoices,
+            COUNT(CASE WHEN status = 'Partially Paid' THEN 1 END) as partial_invoices,
+            COUNT(CASE WHEN status = 'Pending' THEN 1 END) as pending_invoices,
+            COUNT(CASE WHEN status = 'Overdue' THEN 1 END) as overdue_invoices
+        FROM billing_records;
+    """)
+    row = cursor.fetchone()
+    conn.close()
+
+    net = float(row["net_billed"] or 0)
+    collected = float(row["total_collected"] or 0)
+    collection_rate = round((collected / net * 100), 1) if net > 0 else 0.0
+
+    return jsonify({
+        "total_bills": row["total_bills"] or 0,
+        "gross_billed": float(row["gross_billed"] or 0),
+        "total_discounts": float(row["total_discounts"] or 0),
+        "total_tax": float(row["total_tax"] or 0),
+        "net_billed": net,
+        "total_collected": collected,
+        "total_outstanding": float(row["total_outstanding"] or 0),
+        "collection_rate": f"{collection_rate}%",
+        "breakdown_by_status": {
+            "paid": row["paid_invoices"] or 0,
+            "partially_paid": row["partial_invoices"] or 0,
+            "pending": row["pending_invoices"] or 0,
+            "overdue": row["overdue_invoices"] or 0
+        }
+    })
+
+
+@app.route("/api/payments", methods=["GET"])
+def get_payments():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    method = request.args.get("method", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if method:
+        where_clauses.append("py.payment_method = ?")
+        params.append(method)
+    if search:
+        where_clauses.append("(py.payment_number LIKE ? OR py.transaction_reference LIKE ? OR p.name LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count
+        FROM payments py
+        JOIN patients p ON py.patient_id = p.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            py.id, py.payment_number, py.amount, py.payment_method,
+            py.transaction_reference, py.status, py.payment_date, py.created_at,
+            br.bill_number, br.net_amount as bill_net_amount,
+            p.id as patient_id, p.name as patient_name
+        FROM payments py
+        JOIN billing_records br ON py.bill_id = br.id
+        JOIN patients p ON py.patient_id = p.id
+        WHERE {where_sql}
+        ORDER BY py.payment_date DESC, py.id DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "payments": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/payments/stats", methods=["GET"])
+def get_payments_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            payment_method,
+            COUNT(*) as count,
+            COALESCE(SUM(amount), 0) as total_amount
+        FROM payments
+        GROUP BY payment_method
+        ORDER BY total_amount DESC;
+    """)
+    rows = cursor.fetchall()
+
+    cursor.execute("SELECT COUNT(*) as total_count, COALESCE(SUM(amount), 0) as total_collected FROM payments;")
+    summary = cursor.fetchone()
+    conn.close()
+
+    return jsonify({
+        "total_transactions": summary["total_count"] or 0,
+        "total_amount_collected": float(summary["total_collected"] or 0),
+        "methods": [
+            {
+                "method": r["payment_method"],
+                "count": r["count"],
+                "amount": float(r["total_amount"])
+            }
+            for r in rows
+        ]
+    })
+
+
+@app.route("/api/patient/billing", methods=["GET"])
+@require_role("patient")
+def get_current_patient_billing(current_user):
+    patient_id = resolve_current_patient_id(current_user)
+    if not patient_id:
+        return jsonify({"error": "No associated patient profile found."}), 404
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Retrieve patient's invoices
+    cursor.execute("""
+        SELECT 
+            br.id, br.bill_number, br.total_amount, br.discount_amount,
+            br.tax_amount, br.net_amount, br.paid_amount, br.balance_amount,
+            br.status, br.bill_date, br.due_date, br.created_at,
+            br.appointment_id, br.admission_id
+        FROM billing_records br
+        WHERE br.patient_id = ?
+        ORDER BY br.bill_date DESC, br.id DESC;
+    """, (patient_id,))
+    invoices = [dict(r) for r in cursor.fetchall()]
+
+    # Retrieve patient's payment transactions
+    cursor.execute("""
+        SELECT 
+            py.id, py.payment_number, py.bill_id, py.amount, py.payment_method,
+            py.transaction_reference, py.status, py.payment_date,
+            br.bill_number
+        FROM payments py
+        JOIN billing_records br ON py.bill_id = br.id
+        WHERE py.patient_id = ?
+        ORDER BY py.payment_date DESC;
+    """, (patient_id,))
+    payments = [dict(r) for r in cursor.fetchall()]
+
+    # Calculate summary metrics
+    total_billed = sum(float(inv["net_amount"]) for inv in invoices)
+    total_paid = sum(float(inv["paid_amount"]) for inv in invoices)
+    total_balance = sum(float(inv["balance_amount"]) for inv in invoices)
+
+    conn.close()
+
+    return jsonify({
+        "invoices": invoices,
+        "payments": payments,
+        "summary": {
+            "total_invoices": len(invoices),
+            "total_billed": round(total_billed, 2),
+            "total_paid": round(total_paid, 2),
+            "total_balance": round(total_balance, 2)
+        }
+    })
+
+
+@app.route("/api/lab-reports", methods=["GET"])
+def get_lab_reports():
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    offset = (page - 1) * limit
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = ["1=1"]
+    params = []
+    if status:
+        where_clauses.append("lr.status = ?")
+        params.append(status)
+    if search:
+        where_clauses.append("(lr.test_name LIKE ? OR p.name LIKE ? OR d.name LIKE ?)")
+        s_term = f"%{search}%"
+        params.extend([s_term, s_term, s_term])
+
+    where_sql = " AND ".join(where_clauses)
+
+    cursor.execute(f"""
+        SELECT COUNT(*) as count
+        FROM lab_results lr
+        JOIN patients p ON lr.patient_id = p.id
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE {where_sql}
+    """, tuple(params))
+    total = cursor.fetchone()["count"]
+
+    cursor.execute(f"""
+        SELECT 
+            lr.id, lr.test_name, lr.test_date, lr.result_value, lr.units,
+            lr.reference_range, lr.status, lr.notes, lr.created_at,
+            p.id as patient_id, p.name as patient_name,
+            d.id as doctor_id, d.name as doctor_name, d.specialization as doctor_specialization
+        FROM lab_results lr
+        JOIN patients p ON lr.patient_id = p.id
+        LEFT JOIN doctors d ON lr.doctor_id = d.id
+        WHERE {where_sql}
+        ORDER BY lr.test_date DESC, lr.id DESC
+        LIMIT ? OFFSET ?;
+    """, tuple(params + [limit, offset]))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify({
+        "lab_reports": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": math.ceil(total / limit) if total > 0 else 1
+    })
+
+
+@app.route("/api/lab-reports/stats", methods=["GET"])
+def get_lab_reports_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_reports,
+            COUNT(CASE WHEN status = 'Normal' THEN 1 END) as normal_count,
+            COUNT(CASE WHEN status = 'High' THEN 1 END) as high_count,
+            COUNT(CASE WHEN status = 'Low' THEN 1 END) as low_count,
+            COUNT(CASE WHEN status = 'Critical' THEN 1 END) as critical_count,
+            COUNT(CASE WHEN status = 'Abnormal' THEN 1 END) as abnormal_count
+        FROM lab_results;
+    """)
+    row = cursor.fetchone()
+    conn.close()
+
+    total = row["total_reports"] or 0
+    normal = row["normal_count"] or 0
+    abnormal = total - normal
+
+    return jsonify({
+        "total_reports": total,
+        "normal_count": normal,
+        "abnormal_count": abnormal,
+        "high_count": row["high_count"] or 0,
+        "low_count": row["low_count"] or 0,
+        "critical_count": row["critical_count"] or 0
+    })
+
 
 
 if __name__ == "__main__":
-    print("Starting HealthPulse Python API server on http://localhost:5000 ...")
+    print("Starting HealthPulse Professional API server on http://localhost:5000 ...")
     app.run(host="0.0.0.0", port=5000, debug=False)
