@@ -1127,23 +1127,31 @@ class HospitalSyntheticDataGenerator:
             adm_batch = []
             occupied_beds = set()
 
+            # Fetch currently active beds to guarantee zero overlapping occupancy
+            self.cur.execute("SELECT bed_id FROM admissions WHERE status = 'Admitted';")
+            currently_occupied = {r[0] for r in self.cur.fetchall()}
+            available_for_active = [b for b in all_beds if b not in currently_occupied]
+
+            active_idx = 0
             for i in range(needed_adm):
                 adm_idx = curr_adm + i + 1
                 adm_num = f"ADM-2026-{adm_idx:06d}"
                 pat_id = random.choice(patient_ids)
-                bed_id = all_beds[i % len(all_beds)]
                 doc_id = random.choice(doctor_ids)
 
                 reason = random.choice(adm_reasons)
                 diag = f"Inpatient primary diagnosis: {reason}"
 
-                # 4,000 past admissions (Discharged), 1,000 current admissions (Admitted)
+                # Past admissions vs currently active admissions
                 if i < target_dis:
-                    # Past admission
+                    # Past admission (Discharged) - can safely use any bed
+                    bed_id = all_beds[i % len(all_beds)]
                     adm_date = today - timedelta(days=random.randint(15, 365), hours=random.randint(1, 23))
                     status = 'Discharged'
                 else:
-                    # Active inpatient currently admitted in hospital
+                    # Active inpatient currently admitted in hospital - must use an unoccupied bed
+                    bed_id = available_for_active[active_idx % len(available_for_active)]
+                    active_idx += 1
                     adm_date = today - timedelta(days=random.randint(1, 14), hours=random.randint(1, 23))
                     status = 'Admitted'
                     occupied_beds.add(bed_id)

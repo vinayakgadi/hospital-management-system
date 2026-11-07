@@ -43,27 +43,28 @@ from generate_synthetic_data import HospitalSyntheticDataGenerator
 
 
 def seed_database(
-    departments=10,
-    doctors=20,
-    staff=30,
-    medicines=100,
-    rooms=20,
-    beds=50,
-    patients=100,
-    appointments=200,
-    medical_records=150,
-    prescriptions=120,
-    prescription_items=150,
-    lab_reports=100,
-    bills=200,
-    payments=180,
-    admissions=40,
-    discharges=30,
+    departments=25,
+    doctors=200,
+    staff=500,
+    medicines=2000,
+    rooms=500,
+    beds=2000,
+    patients=10000,
+    appointments=25000,
+    medical_records=20000,
+    prescriptions=15000,
+    prescription_items=30000,
+    lab_reports=12000,
+    bills=25000,
+    payments=30000,
+    admissions=5000,
+    discharges=4000,
     batch_size=2000
 ):
     print("=" * 72)
     print("HEALTHPULSE DATABASE SEEDING PROCESS")
     print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("Target Population: 181,225+ Interconnected Records across 16 Clinical Tables")
     print("=" * 72)
 
     gen = HospitalSyntheticDataGenerator(batch_size=batch_size)
@@ -163,44 +164,44 @@ def seed_database(
 
 def main():
     parser = argparse.ArgumentParser(description="HealthPulse Hospital Management System Database Seeder")
-    parser.add_argument("--patients", type=int, default=100, help="Number of patients (default: 100)")
-    parser.add_argument("--doctors", type=int, default=20, help="Number of doctors (default: 20)")
-    parser.add_argument("--departments", type=int, default=10, help="Number of departments (default: 10)")
-    parser.add_argument("--appointments", type=int, default=200, help="Number of appointments (default: 200)")
-    parser.add_argument("--medical-records", type=int, default=150, help="Number of medical records (default: 150)")
-    parser.add_argument("--prescriptions", type=int, default=120, help="Number of prescriptions (default: 120)")
-    parser.add_argument("--medicines", type=int, default=100, help="Number of medicines in catalog (default: 100)")
-    parser.add_argument("--lab-reports", type=int, default=100, help="Number of lab reports (default: 100)")
-    parser.add_argument("--bills", type=int, default=200, help="Number of billing invoices (default: 200)")
-    parser.add_argument("--payments", type=int, default=180, help="Number of payments (default: 180)")
-    parser.add_argument("--staff", type=int, default=30, help="Number of staff members (default: 30)")
-    parser.add_argument("--rooms", type=int, default=20, help="Number of rooms (default: 20)")
-    parser.add_argument("--beds", type=int, default=50, help="Number of beds (default: 50)")
-    parser.add_argument("--admissions", type=int, default=40, help="Number of admissions (default: 40)")
-    parser.add_argument("--discharges", type=int, default=30, help="Number of discharges (default: 30)")
-    parser.add_argument("--full", action="store_true", help="Scale up to enterprise dataset (180,000+ records)")
+    parser.add_argument("--patients", type=int, default=10000, help="Number of patients (default: 10,000)")
+    parser.add_argument("--doctors", type=int, default=200, help="Number of doctors (default: 200)")
+    parser.add_argument("--departments", type=int, default=25, help="Number of departments (default: 25)")
+    parser.add_argument("--appointments", type=int, default=25000, help="Number of appointments (default: 25,000)")
+    parser.add_argument("--medical-records", type=int, default=20000, help="Number of medical records (default: 20,000)")
+    parser.add_argument("--prescriptions", type=int, default=15000, help="Number of prescriptions (default: 15,000)")
+    parser.add_argument("--medicines", type=int, default=2000, help="Number of medicines in catalog (default: 2,000)")
+    parser.add_argument("--lab-reports", type=int, default=12000, help="Number of lab reports (default: 12,000)")
+    parser.add_argument("--bills", type=int, default=25000, help="Number of billing invoices (default: 25,000)")
+    parser.add_argument("--payments", type=int, default=30000, help="Number of payments (default: 30,000)")
+    parser.add_argument("--staff", type=int, default=500, help="Number of staff members (default: 500)")
+    parser.add_argument("--rooms", type=int, default=500, help="Number of rooms (default: 500)")
+    parser.add_argument("--beds", type=int, default=2000, help="Number of beds (default: 2,000)")
+    parser.add_argument("--admissions", type=int, default=5000, help="Number of admissions (default: 5,000)")
+    parser.add_argument("--discharges", type=int, default=4000, help="Number of discharges (default: 4,000)")
+    parser.add_argument("--sample", action="store_true", help="Quick smoke test mode with scaled down sample")
 
     args = parser.parse_args()
 
-    if args.full:
-        print("[INFO] --full flag provided: scaling to enterprise dataset...")
+    if args.sample:
+        print("[INFO] --sample flag provided: scaling down to test sample...")
         seed_database(
-            departments=25,
-            doctors=200,
-            staff=500,
-            medicines=2000,
-            rooms=500,
-            beds=2000,
-            patients=10000,
-            appointments=25000,
-            medical_records=20000,
-            prescriptions=15000,
-            prescription_items=30000,
-            lab_reports=12000,
-            bills=25000,
-            payments=30000,
-            admissions=5000,
-            discharges=4000
+            departments=10,
+            doctors=20,
+            staff=30,
+            medicines=100,
+            rooms=20,
+            beds=50,
+            patients=100,
+            appointments=200,
+            medical_records=150,
+            prescriptions=120,
+            prescription_items=150,
+            lab_reports=100,
+            bills=200,
+            payments=180,
+            admissions=40,
+            discharges=30
         )
     else:
         seed_database(
@@ -214,7 +215,7 @@ def main():
             appointments=args.appointments,
             medical_records=args.medical_records,
             prescriptions=args.prescriptions,
-            prescription_items=int(args.prescriptions * 1.25),
+            prescription_items=int(args.prescriptions * 2.0),
             lab_reports=args.lab_reports,
             bills=args.bills,
             payments=args.payments,
