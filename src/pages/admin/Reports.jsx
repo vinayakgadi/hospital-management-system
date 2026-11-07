@@ -540,8 +540,8 @@ export default function Reports() {
           <div className="row g-4 mb-4">
             {/* Department Distribution */}
             <div className="col-12 col-lg-6">
-              <div className="card border-0 shadow-sm rounded-3 h-100 bg-white">
-                <div className="card-body p-4">
+              <div className="card border-0 shadow-sm rounded-3 h-100 bg-white reports-chart-card">
+                <div className="card-body p-4 d-flex flex-column">
                   <div className="d-flex align-items-center justify-content-between mb-3">
                     <div>
                       <h6 className="fw-bold mb-0">Department & Specialization Mix</h6>
@@ -552,45 +552,85 @@ export default function Reports() {
                     </span>
                   </div>
 
-                  <div style={{ height: '260px' }}>
-                    {overviewData.department_distribution.length > 0 ? (
-                      <ResponsiveContainer width="100%" height="100%">
-                        <PieChart>
-                          <Pie
-                            data={overviewData.department_distribution}
-                            dataKey="value"
-                            nameKey="name"
-                            cx="50%"
-                            cy="50%"
-                            outerRadius={85}
-                            innerRadius={45}
-                            paddingAngle={3}
-                          >
-                            {overviewData.department_distribution.map((entry, index) => (
-                              <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                            ))}
-                          </Pie>
-                          <Tooltip
-                            formatter={(value, name) => [`${value} Doctors`, name]}
-                            contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
-                          />
-                          <Legend verticalAlign="bottom" height={36} iconType="circle" />
-                        </PieChart>
-                      </ResponsiveContainer>
-                    ) : (
-                      <div className="h-100 d-flex align-items-center justify-content-center text-muted small">
-                        No department distribution data available.
+                  {overviewData.department_distribution.length > 0 ? (
+                    <>
+                      {/* Centered Proportionate Donut Chart */}
+                      <div className="reports-chart-container" style={{ height: '220px' }}>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart margin={{ top: 5, right: 5, bottom: 5, left: 5 }}>
+                            <Pie
+                              data={overviewData.department_distribution}
+                              dataKey="value"
+                              nameKey="name"
+                              cx="50%"
+                              cy="50%"
+                              outerRadius={80}
+                              innerRadius={50}
+                              paddingAngle={2}
+                            >
+                              {overviewData.department_distribution.map((entry, index) => (
+                                <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                              ))}
+                            </Pie>
+                            <Tooltip
+                              formatter={(value, name) => [`${value} Doctors`, name]}
+                              contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
+                            />
+                          </PieChart>
+                        </ResponsiveContainer>
+
+                        {/* Donut Chart Center Badge */}
+                        <div
+                          className="position-absolute d-flex flex-column align-items-center justify-content-center text-center"
+                          style={{
+                            top: '50%',
+                            left: '50%',
+                            transform: 'translate(-50%, -50%)',
+                            pointerEvents: 'none',
+                          }}
+                        >
+                          <span className="fw-bold fs-5 text-dark lh-1">
+                            {overviewData.overview?.total_doctors || overviewData.department_distribution.reduce((acc, curr) => acc + (curr.value || 0), 0)}
+                          </span>
+                          <span className="text-muted text-uppercase" style={{ fontSize: '0.65rem', letterSpacing: '0.04em', marginTop: '2px' }}>
+                            Doctors
+                          </span>
+                        </div>
                       </div>
-                    )}
-                  </div>
+
+                      {/* Responsive Multi-Column Legend Below Donut Chart */}
+                      <div className="dept-legend-container mt-3 pt-3 border-top">
+                        <div className="dept-legend-grid">
+                          {overviewData.department_distribution.map((entry, index) => (
+                            <div
+                              key={`dept-legend-${entry.name}-${index}`}
+                              className="dept-legend-item"
+                              title={`${entry.name}: ${entry.value} Doctors`}
+                            >
+                              <span
+                                className="dept-legend-dot"
+                                style={{ backgroundColor: COLORS[index % COLORS.length] }}
+                              />
+                              <span className="dept-legend-label">{entry.name}</span>
+                              <span className="dept-legend-value">({entry.value})</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="h-100 d-flex align-items-center justify-content-center text-muted small py-5">
+                      No department distribution data available.
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
 
             {/* Appointment Status Pipeline */}
             <div className="col-12 col-lg-6">
-              <div className="card border-0 shadow-sm rounded-3 h-100 bg-white">
-                <div className="card-body p-4">
+              <div className="card border-0 shadow-sm rounded-3 h-100 bg-white reports-chart-card">
+                <div className="card-body p-4 d-flex flex-column">
                   <div className="d-flex align-items-center justify-content-between mb-3">
                     <div>
                       <h6 className="fw-bold mb-0">Appointment Pipeline Status</h6>
@@ -599,7 +639,7 @@ export default function Reports() {
                     <span className="badge bg-light text-dark border">Pipeline</span>
                   </div>
 
-                  <div style={{ height: '260px' }}>
+                  <div className="reports-chart-container flex-grow-1" style={{ minHeight: '260px' }}>
                     {overviewData.appointments_by_status.length > 0 ? (
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart data={overviewData.appointments_by_status} margin={{ top: 15, right: 20, left: -10, bottom: 5 }}>
@@ -617,7 +657,7 @@ export default function Reports() {
                         </BarChart>
                       </ResponsiveContainer>
                     ) : (
-                      <div className="h-100 d-flex align-items-center justify-content-center text-muted small">
+                      <div className="h-100 d-flex align-items-center justify-content-center text-muted small py-5">
                         No appointment status data recorded.
                       </div>
                     )}
@@ -628,39 +668,63 @@ export default function Reports() {
           </div>
 
           {/* Lower Row: Records & Prescriptions Status */}
-          <div className="row g-4">
+          <div className="row g-4 mb-4">
             {/* Medical Records Status */}
             <div className="col-12 col-lg-6">
-              <div className="card border-0 shadow-sm rounded-3 h-100 bg-white">
-                <div className="card-body p-4">
-                  <h6 className="fw-bold mb-1">EMR Documentation Status</h6>
-                  <small className="text-muted d-block mb-3">Draft vs Finalized consultation documentation ratio</small>
-                  <div style={{ height: '220px' }}>
+              <div className="card border-0 shadow-sm rounded-3 h-100 bg-white reports-chart-card">
+                <div className="card-body p-4 d-flex flex-column">
+                  <div className="mb-3">
+                    <h6 className="fw-bold mb-1">EMR Documentation Status</h6>
+                    <small className="text-muted d-block">Draft vs Finalized consultation documentation ratio</small>
+                  </div>
+                  <div className="reports-chart-container position-relative flex-grow-1" style={{ minHeight: '220px', height: '220px' }}>
                     {overviewData.records_by_status.length > 0 ? (
-                      <ResponsiveContainer width="100%" height="100%">
-                        <PieChart>
-                          <Pie
-                            data={overviewData.records_by_status}
-                            dataKey="count"
-                            nameKey="status"
-                            cx="50%"
-                            cy="50%"
-                            outerRadius={75}
-                            innerRadius={40}
-                          >
-                            {overviewData.records_by_status.map((entry, index) => (
-                              <Cell
-                                key={`rec-${index}`}
-                                fill={STATUS_COLORS[entry.status] || COLORS[index % COLORS.length]}
-                              />
-                            ))}
-                          </Pie>
-                          <Tooltip />
-                          <Legend verticalAlign="bottom" height={36} iconType="circle" />
-                        </PieChart>
-                      </ResponsiveContainer>
+                      <>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart margin={{ top: 5, right: 5, bottom: 5, left: 5 }}>
+                            <Pie
+                              data={overviewData.records_by_status}
+                              dataKey="count"
+                              nameKey="status"
+                              cx="50%"
+                              cy="50%"
+                              outerRadius={75}
+                              innerRadius={45}
+                            >
+                              {overviewData.records_by_status.map((entry, index) => (
+                                <Cell
+                                  key={`rec-${index}`}
+                                  fill={STATUS_COLORS[entry.status] || COLORS[index % COLORS.length]}
+                                />
+                              ))}
+                            </Pie>
+                            <Tooltip
+                              formatter={(value, name) => [`${value} Records`, name]}
+                              contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
+                            />
+                            <Legend verticalAlign="bottom" height={36} iconType="circle" />
+                          </PieChart>
+                        </ResponsiveContainer>
+                        {/* EMR Center Badge */}
+                        <div
+                          className="position-absolute d-flex flex-column align-items-center justify-content-center text-center"
+                          style={{
+                            top: '42%',
+                            left: '50%',
+                            transform: 'translate(-50%, -50%)',
+                            pointerEvents: 'none',
+                          }}
+                        >
+                          <span className="fw-bold fs-6 text-dark lh-1">
+                            {overviewData.records_by_status.reduce((acc, curr) => acc + (curr.count || 0), 0)}
+                          </span>
+                          <span className="text-muted text-uppercase" style={{ fontSize: '0.62rem', letterSpacing: '0.04em', marginTop: '2px' }}>
+                            Records
+                          </span>
+                        </div>
+                      </>
                     ) : (
-                      <div className="h-100 d-flex align-items-center justify-content-center text-muted small">
+                      <div className="h-100 d-flex align-items-center justify-content-center text-muted small py-4">
                         No medical record data available.
                       </div>
                     )}
@@ -671,19 +735,23 @@ export default function Reports() {
 
             {/* Prescriptions by Status */}
             <div className="col-12 col-lg-6">
-              <div className="card border-0 shadow-sm rounded-3 h-100 bg-white">
-                <div className="card-body p-4">
-                  <h6 className="fw-bold mb-1">Prescriptions Fulfillment Status</h6>
-                  <small className="text-muted d-block mb-3">Active vs Completed pharmacy medication orders</small>
-                  <div style={{ height: '220px' }}>
+              <div className="card border-0 shadow-sm rounded-3 h-100 bg-white reports-chart-card">
+                <div className="card-body p-4 d-flex flex-column">
+                  <div className="mb-3">
+                    <h6 className="fw-bold mb-1">Prescriptions Fulfillment Status</h6>
+                    <small className="text-muted d-block">Active vs Completed pharmacy medication orders</small>
+                  </div>
+                  <div className="reports-chart-container flex-grow-1" style={{ minHeight: '220px', height: '220px' }}>
                     {overviewData.prescriptions_by_status.length > 0 ? (
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart data={overviewData.prescriptions_by_status} margin={{ top: 15, right: 20, left: -10, bottom: 5 }}>
                           <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                           <XAxis dataKey="status" tick={{ fill: '#64748b', fontSize: 12 }} />
                           <YAxis allowDecimals={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                          <Tooltip />
-                          <Bar dataKey="count" name="Orders" fill="#0284c7" radius={[6, 6, 0, 0]}>
+                          <Tooltip
+                            contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
+                          />
+                          <Bar dataKey="count" name="Prescriptions" fill="#0284c7" radius={[6, 6, 0, 0]}>
                             {overviewData.prescriptions_by_status.map((entry, index) => (
                               <Cell
                                 key={`rx-${index}`}
@@ -694,7 +762,7 @@ export default function Reports() {
                         </BarChart>
                       </ResponsiveContainer>
                     ) : (
-                      <div className="h-100 d-flex align-items-center justify-content-center text-muted small">
+                      <div className="h-100 d-flex align-items-center justify-content-center text-muted small py-4">
                         No prescription data available.
                       </div>
                     )}

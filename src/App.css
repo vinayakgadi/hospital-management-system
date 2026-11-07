@@ -411,3 +411,117 @@
     display: none !important;
   }
 }
+
+/* ============================================================
+   Admin Reports Dashboard & Analytics Charts
+   ============================================================ */
+
+.reports-chart-card {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+}
+
+.reports-chart-container {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  position: relative;
+  box-sizing: border-box;
+}
+
+.dept-legend-container {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  max-height: 165px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
+}
+
+/* Custom scrollbar for multi-column department legend */
+.dept-legend-container::-webkit-scrollbar {
+  width: 5px;
+}
+.dept-legend-container::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+.dept-legend-container::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+.dept-legend-container::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+.dept-legend-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 12px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+@media (max-width: 1199.98px) {
+  .dept-legend-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px 10px;
+  }
+}
+
+@media (max-width: 575.98px) {
+  .dept-legend-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 8px;
+  }
+}
+
+.dept-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background-color: #f8fafc;
+  border: 1px solid #f1f5f9;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+  cursor: default;
+  box-sizing: border-box;
+}
+
+.dept-legend-item:hover {
+  background-color: #f1f5f9;
+  border-color: #e2e8f0;
+}
+
+.dept-legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dept-legend-label {
+  font-size: 0.76rem;
+  font-weight: 500;
+  color: #334155;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+
+.dept-legend-value {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #64748b;
+  flex-shrink: 0;
+}
